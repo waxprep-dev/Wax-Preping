@@ -44,35 +44,6 @@ class SecurityManager:
     def unseal_payload(self, sealed: str) -> str:
         return self.fernet.decrypt(sealed.encode()).decode()
     
-    async def check_rate_limit(self, phone_number: str) -> bool:
-        # In-memory sliding window for broke mode
-        # When you scale, swap this for Redis
-        now = time.time()
-        window = 60
-        
-        if not hasattr(self, '_rate_cache'):
-            self._rate_cache = {}
-            self._global_cache = []
-        
-        # Clean old entries
-        self._rate_cache[phone_number] = [
-            t for t in self._rate_cache.get(phone_number, []) 
-            if now - t < window
-        ]
-        self._global_cache = [t for t in self._global_cache if now - t < window]
-        
-        # Check limits
-        if len(self._rate_cache.get(phone_number, [])) >= settings.RATE_LIMIT_PER_PHONE:
-            return False
-        if len(self._global_cache) >= settings.RATE_LIMIT_GLOBAL:
-            return False
-        
-        # Record
-        self._rate_cache.setdefault(phone_number, []).append(now)
-        self._global_cache.append(now)
-        
-        return True
-    
     def generate_wax_id(self, phone_number: str) -> str:
         raw = f"{phone_number}:{settings.WHATSAPP_APP_SECRET}:wax_v1"
         hash_bytes = hashlib.blake2b(raw.encode(), digest_size=16).hexdigest()
