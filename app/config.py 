@@ -1,0 +1,61 @@
+import os
+from functools import lru_cache
+from typing import List, Optional
+
+from pydantic_settings import BaseSettings
+from pydantic import Field, field_validator
+
+
+class Settings(BaseSettings):
+    # Meta WhatsApp
+    WHATSAPP_VERIFY_TOKEN: str = Field(..., description="Meta webhook verification token")
+    WHATSAPP_APP_SECRET: str = Field(..., description="Meta App Secret for HMAC signature")
+    WHATSAPP_PHONE_NUMBER_ID: str = Field(..., description="Your WhatsApp phone number ID")
+    
+    # Security
+    ALLOWED_IP_RANGES: str = Field(default="", description="Comma-separated CIDR ranges. Leave empty to allow all.")
+    RATE_LIMIT_PER_PHONE: int = Field(default=30, description="Messages per minute per phone number")
+    RATE_LIMIT_GLOBAL: int = Field(default=1000, description="Global messages per minute")
+    
+    # Encryption
+    ENCRYPTION_KEY: str = Field(..., description="Fernet key for payload sealing. Generate with: cryptography.fernet.Fernet.generate_key()")
+    
+    # Database
+    DATABASE_URL: str = Field(..., description="Async PostgreSQL URL. e.g. postgresql+asyncpg://user:pass@host/db")
+    
+    # Redis
+    REDIS_URL: str = Field(..., description="Redis URL. e.g. redis://localhost:6379")
+    REDIS_STREAM_PREFIX: str = Field(default="wax:msg", description="Prefix for Redis streams")
+    
+    # Worker
+    AI_TEAM_WEBHOOK_URL: Optional[str] = Field(default=None, description="Your AI team's endpoint to forward messages")
+    AI_TEAM_API_KEY: Optional[str] = Field(default=None, description="API key for AI team endpoint")
+    MAX_RETRIES: int = Field(default=5, description="Max retries to AI team")
+    RETRY_BASE_DELAY: float = Field(default=2.0, description="Base seconds for exponential backoff")
+    
+    # App
+    ENVIRONMENT: str = Field(default="development")
+    LOG_LEVEL: str = Field(default="INFO")
+    
+    @field_validator("ALLOWED_IP_RANGES", mode="before")
+    @classmethod
+    def parse_ip_ranges(cls, v):
+        if not v:
+            return []
+        return [x.strip() for x in v.split(",") if x.strip()]
+    
+    @field_validator("ENCRYPTION_KEY", mode="before")
+    @classmethod
+    def validate_fernet_key(cls, v):
+        if not v:
+            raise ValueError("ENCRYPTION_KEY is required")
+        return v
+    
+    class Config:
+        env_file = ".env"
+        env_file_encoding = "utf-8"
+
+
+@lru_cache()
+def get_settings() -> Settings:
+    return Settings()
