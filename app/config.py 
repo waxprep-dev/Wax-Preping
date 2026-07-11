@@ -1,4 +1,3 @@
-import os
 from functools import lru_cache
 from typing import List, Optional
 
@@ -7,33 +6,25 @@ from pydantic import Field, field_validator
 
 
 class Settings(BaseSettings):
-    # Meta WhatsApp
-    WHATSAPP_VERIFY_TOKEN: str = Field(..., description="Meta webhook verification token")
-    WHATSAPP_APP_SECRET: str = Field(..., description="Meta App Secret for HMAC signature")
-    WHATSAPP_PHONE_NUMBER_ID: str = Field(..., description="Your WhatsApp phone number ID")
+    WHATSAPP_VERIFY_TOKEN: str = Field(...)
+    WHATSAPP_APP_SECRET: str = Field(...)
+    WHATSAPP_PHONE_NUMBER_ID: str = Field(...)
     
-    # Security
-    ALLOWED_IP_RANGES: str = Field(default="", description="Comma-separated CIDR ranges. Leave empty to allow all.")
-    RATE_LIMIT_PER_PHONE: int = Field(default=30, description="Messages per minute per phone number")
-    RATE_LIMIT_GLOBAL: int = Field(default=1000, description="Global messages per minute")
+    ALLOWED_IP_RANGES: str = Field(default="")
+    RATE_LIMIT_PER_PHONE: int = Field(default=30)
+    RATE_LIMIT_GLOBAL: int = Field(default=1000)
     
-    # Encryption
-    ENCRYPTION_KEY: str = Field(..., description="Fernet key for payload sealing. Generate with: cryptography.fernet.Fernet.generate_key()")
+    ENCRYPTION_KEY: str = Field(...)
     
-    # Database
-    DATABASE_URL: str = Field(..., description="Async PostgreSQL URL. e.g. postgresql+asyncpg://user:pass@host/db")
+    # SQLite for broke mode. Change to PostgreSQL when you have money.
+    DATABASE_URL: str = Field(default="sqlite+aiosqlite:///./wax.db")
     
-    # Redis
-    REDIS_URL: str = Field(..., description="Redis URL. e.g. redis://localhost:6379")
-    REDIS_STREAM_PREFIX: str = Field(default="wax:msg", description="Prefix for Redis streams")
+    # AI Team endpoint (leave empty if not ready yet)
+    AI_TEAM_WEBHOOK_URL: Optional[str] = Field(default=None)
+    AI_TEAM_API_KEY: Optional[str] = Field(default=None)
+    MAX_RETRIES: int = Field(default=5)
+    RETRY_BASE_DELAY: float = Field(default=2.0)
     
-    # Worker
-    AI_TEAM_WEBHOOK_URL: Optional[str] = Field(default=None, description="Your AI team's endpoint to forward messages")
-    AI_TEAM_API_KEY: Optional[str] = Field(default=None, description="API key for AI team endpoint")
-    MAX_RETRIES: int = Field(default=5, description="Max retries to AI team")
-    RETRY_BASE_DELAY: float = Field(default=2.0, description="Base seconds for exponential backoff")
-    
-    # App
     ENVIRONMENT: str = Field(default="development")
     LOG_LEVEL: str = Field(default="INFO")
     
