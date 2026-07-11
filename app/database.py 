@@ -1,16 +1,18 @@
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import declarative_base
-from sqlalchemy import Column, String, DateTime, Integer, Text, Index, UniqueConstraint, select, func
-from datetime import datetime
+from sqlalchemy import Column, String, DateTime, Integer, Text, Index, UniqueConstraint, select, update, and_
+from datetime import datetime, timedelta
 
 from app.config import get_settings
 
 settings = get_settings()
 
-# SQLite for now. PostgreSQL later. Same code.
 engine = create_async_engine(
     settings.DATABASE_URL,
-    echo=settings.ENVIRONMENT == "development"
+    echo=False,
+    pool_size=5,
+    max_overflow=10,
+    pool_pre_ping=True
 )
 
 AsyncSessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
@@ -23,10 +25,8 @@ class WaxUser(Base):
     
     id = Column(String(32), primary_key=True)
     phone_hash = Column(String(64), nullable=False, index=True)
-    phone_country = Column(String(5), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     last_seen_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-    metadata_json = Column(Text, nullable=True)
     
     __table_args__ = (UniqueConstraint('phone_hash', name='uix_phone_hash'),)
 
@@ -40,24 +40,23 @@ class WebhookEvent(Base):
     signature = Column(String(128), nullable=False)
     stream_name = Column(String(64), nullable=False)
     received_at = Column(DateTime, default=datetime.utcnow)
-    processed_at = Column(DateTime, nullable=True)
     
     __table_args__ = (Index('ix_event_id', 'event_id'),)
 
 
 class MessageQueue(Base):
-    """SQLite-based queue. Replaces Redis Streams for broke mode."""
     __tablename__ = "message_queue"
     
     id = Column(Integer, primary_key=True, autoincrement=True)
     event_id = Column(String(128), nullable=False, index=True)
     payload_encrypted = Column(Text, nullable=False)
-    status = Column(String(20), default="pending")  # pending, processing, retry, dead
+    status = Column(String(20), default="pending")
     retry_count = Column(Integer, default=0)
     stream_type = Column(String(32), nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
     processed_at = Column(DateTime, nullable=True)
     next_attempt_at = Column(DateTime, nullable=True)
+    error = Column(Text, nullable=True)
 
 
 class MessageStatus(Base):
