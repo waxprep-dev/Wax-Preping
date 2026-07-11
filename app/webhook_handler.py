@@ -3,7 +3,7 @@ import hashlib
 from typing import Dict, Any, Optional
 from datetime import datetime
 
-from app.security import security
+from app.security import get_security_manager
 
 
 class MessageClassifier:
@@ -63,7 +63,8 @@ class WebhookNormalizer:
         msg = value["messages"][0]
         contact = value.get("contacts", [{}])[0]
         phone = msg.get("from", "")
-        wax_id = security.generate_wax_id(phone)
+        sec = get_security_manager()
+        wax_id = sec.generate_wax_id(phone)
         
         content = json.dumps(msg.get(msg.get("type", "text"), {}), sort_keys=True)
         fingerprint = hashlib.blake2b(
@@ -93,9 +94,10 @@ class WebhookNormalizer:
     def _normalize_status(self, value: Dict, phone_number_id: str) -> Dict[str, Any]:
         status = value["statuses"][0]
         phone = status.get("recipient_id", "")
+        sec = get_security_manager()
         return {
             "event_type": "status",
-            "wax_id": security.generate_wax_id(phone),
+            "wax_id": sec.generate_wax_id(phone),
             "phone_number": phone,
             "phone_number_id": phone_number_id,
             "message_id": status.get("id"),
