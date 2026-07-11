@@ -1,107 +1,133 @@
 import json
-import asyncio
-import httpx
+import hashlib
+from typing import Dict, Any, Optional
+from datetime import datetime
 
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
-
-from app.config import get_settings
-from app.database import AsyncSessionLocal, MessageStatus, MessageQueue
-from app.security import security
-from app.webhook_handler import StateMachine
-from app.queue import publisher
-
-settings = get_settings()
-state_machine = StateMachine()
+from app.security import get_security_manager
 
 
-class BackgroundWorker:
-    def __init__(self):
-        self.running = True
+class MessageClassifier:
+    STREAM_TEXT = "text"
+    STREAM_STATUS = "status"
+    STREAM_REACTION = "reaction"
+    STREAM_INTERACTIVE = "interactive"
+    STREAM_LOCATION = "location"
+    STREAM_UNKNOWN = "unknown"
     
-    async def run(self):
-        while self.running:
-            try:
-                async with AsyncSessionLocal() as session:
-                    pending = await publisher.get_pending(session, limit=5)
-                    
-                    for item in pending:
-                        if not self.running:
-                            break
-                        await self._process_one(session, item)
-                        
-            except Exception as e:
-                print(f"Worker error: {e}")
-            
-            await asyncio.sleep(2)  # Poll every 2 seconds
-    
-    async def _process_one(self, session: AsyncSession, item: MessageQueue):
-        await publisher.mark_processing(session, item.id)
+    @classmethod
+    def classify(cls, payload: Dict[str, Any]) -> str:
+        entry = payload.get("entry", [{}])[0]
+        changes = entry.get("changes", [{}])[0]
+        value = changes.get("value", {})
         
-        try:
-            normalized = json.loads(security.unseal_payload(item.payload_encrypted))
-            
-            # Handle status state machine
-            if normalized["event_type"] == "status":
-                await self._handle_status(session, normalized)
-            
-            # Forward to AI team if configured
-            if settings.AI_TEAM_WEBHOOK_URL:
-                await self._forward_to_ai(normalized)
-            
-            await publisher.mark_completed(session, item.id)
-            
-        except Exception as e:
-            if item.retry_count < settings.MAX_RETRIES:
-                await publisher.schedule_retry(session, item.id, item.retry_count + 1, settings.RETRY_BASE_DELAY)
-            else:
-                await publisher.mark_dead(session, item.id)
-    
-    async def _handle_status(self, session: AsyncSession, normalized: Dict):
-        result = await session.execute(
-            select(MessageStatus).where(
-                MessageStatus.message_id == normalized["message_id"]
-            ).order_by(MessageStatus.timestamp.desc())
-        )
-        current = result.scalar_one_or_none()
-        current_status = current.status if current else None
-        new_status = normalized["status"]
+        if "messages" in value:
+            msg = value["messages"][0]
+            msg_type = msg.get("type", "")
+            type_map = {
+                "text": cls.STREAM_TEXT,
+                "image": cls.STREAM_UNKNOWN,
+                "audio": cls.STREAM_UNKNOWN,
+                "video": cls.STREAM_UNKNOWN,
+                "document": cls.STREAM_UNKNOWN,
+                "location": cls.STREAM_LOCATION,
+                "contacts": cls.STREAM_UNKNOWN,
+                "sticker": cls.STREAM_UNKNOWN,
+                "reaction": cls.STREAM_REACTION,
+                "interactive": cls.STREAM_INTERACTIVE,
+                "button": cls.STREAM_INTERACTIVE,
+                "unknown": cls.STREAM_UNKNOWN,
+            }
+            return type_map.get(msg_type, cls.STREAM_UNKNOWN)
         
-        inferences = state_machine.infer_missing_states(current_status, new_status)
+        if "statuses" in value:
+            return cls.STREAM_STATUS
         
-        if state_machine.can_transition(current_status, new_status):
-            for inferred in inferences:
-                session.add(MessageStatus(
-                    message_id=normalized["message_id"],
-                    phone_number=normalized["phone_number"],
-                    status=inferred,
-                    timestamp=normalized["timestamp"] - 1
-                ))
-            
-            session.add(MessageStatus(
-                message_id=normalized["message_id"],
-                phone_number=normalized["phone_number"],
-                status=new_status,
-                timestamp=normalized["timestamp"]
-            ))
-            await session.commit()
-    
-    async def _forward_to_ai(self, normalized: Dict):
-        headers = {"Content-Type": "application/json"}
-        if settings.AI_TEAM_API_KEY:
-            headers["X-API-Key"] = settings.AI_TEAM_API_KEY
-        headers["X-Trace-ID"] = normalized.get("trace_id", "")
-        
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(
-                settings.AI_TEAM_WEBHOOK_URL,
-                json=normalized,
-                headers=headers
-            )
-            response.raise_for_status()
-    
-    def stop(self):
-        self.running = False
+        return cls.STREAM_UNKNOWN
 
 
-worker = BackgroundWorker()
+class WebhookNormalizer:
+    def normalize(self, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        entry = payload.get("entry", [{}])[0]
+        changes = entry.get("changes", [{}])[0]
+        value = changes.get("value", {})
+        metadata = value.get("metadata", {})
+        phone_number_id = metadata.get("phone_number_id")
+        
+        if "messages" in value:
+            return self._normalize_message(value, phone_number_id)
+        if "statuses" in value:
+            return self._normalize_status(value, phone_number_id)
+        return None
+    
+    def _normalize_message(self, value: Dict, phone_number_id: str) -> Dict[str, Any]:
+        msg = value["messages"][0]
+        contact = value.get("contacts", [{}])[0]
+        phone = msg.get("from", "")
+        sec = get_security_manager()
+        wax_id = sec.generate_wax_id(phone)
+        
+        content = json.dumps(msg.get(msg.get("type", "text"), {}), sort_keys=True)
+        fingerprint = hashlib.blake2b(
+            f"{phone}:{content}:{msg.get('timestamp', '')}".encode(),
+            digest_size=16
+        ).hexdigest()
+        
+        return {
+            "event_type": "message",
+            "wax_id": wax_id,
+            "phone_number": phone,
+            "phone_number_id": phone_number_id,
+            "message_id": msg.get("id"),
+            "timestamp": int(msg.get("timestamp", 0)),
+            "type": msg.get("type"),
+            "body": msg.get("text", {}).get("body") if msg.get("type") == "text" else None,
+            "raw_message": msg,
+            "contact_name": contact.get("profile", {}).get("name"),
+            "fingerprint": fingerprint,
+            "received_at": datetime.utcnow().isoformat(),
+            "trace_id": hashlib.blake2b(
+                f"{msg.get('id')}:{msg.get('timestamp')}".encode(),
+                digest_size=16
+            ).hexdigest()
+        }
+    
+    def _normalize_status(self, value: Dict, phone_number_id: str) -> Dict[str, Any]:
+        status = value["statuses"][0]
+        phone = status.get("recipient_id", "")
+        sec = get_security_manager()
+        return {
+            "event_type": "status",
+            "wax_id": sec.generate_wax_id(phone),
+            "phone_number": phone,
+            "phone_number_id": phone_number_id,
+            "message_id": status.get("id"),
+            "status": status.get("status"),
+            "timestamp": int(status.get("timestamp", 0)),
+            "conversation_id": status.get("conversation", {}).get("id"),
+            "error_code": status.get("errors", [{}])[0].get("code") if status.get("errors") else None,
+            "received_at": datetime.utcnow().isoformat(),
+            "trace_id": hashlib.blake2b(
+                f"{status.get('id')}:{status.get('timestamp')}".encode(),
+                digest_size=16
+            ).hexdigest()
+        }
+
+
+class StateMachine:
+    VALID_TRANSITIONS = {
+        None: ["sent", "failed"],
+        "sent": ["delivered", "failed", "read"],
+        "delivered": ["read", "failed"],
+        "read": ["failed"],
+        "failed": []
+    }
+    
+    def can_transition(self, current: Optional[str], new: str) -> bool:
+        allowed = self.VALID_TRANSITIONS.get(current, [])
+        return new in allowed
+    
+    def infer_missing_states(self, current: Optional[str], new: str) -> list:
+        inferences = []
+        if new == "read" and current in [None, "sent"]:
+            inferences.append("delivered")
+        return inferences
