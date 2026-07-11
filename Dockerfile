@@ -12,7 +12,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app/ ./app/
 
-# DEBUG: If import fails here, the build fails with the REAL traceback
+# DEBUG: Show exactly what ended up in the image
+RUN echo "=== WORKDIR ===" && pwd && ls -la && echo "=== app/ ===" && ls -la app/ && echo "=== app/__init__.py ===" && cat app/__init__.py && echo "=== app/main.py ===" && ls -la app/main.py
+
 RUN python -c "import sys; sys.path.insert(0, '/app'); import app.main; print('BUILD: app.main imported OK')"
 
 EXPOSE 8000
