@@ -2,6 +2,8 @@ import json
 import asyncio
 import time
 import random
+import sys
+import traceback
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any
 
@@ -13,14 +15,18 @@ from sqlalchemy import select, update, and_
 from app.config import get_settings
 from app.database import init_db, get_db, AsyncSessionLocal, WebhookEvent, MessageQueue, MessageStatus, DeadLetter
 from app.redis_client import get_redis, close_redis
-from app.security import security
+from app.security import get_security_manager
 from app.webhook_handler import WebhookNormalizer, MessageClassifier, StateMachine
 from app.webhook_handler import MessageClassifier as Classifier
 
 import structlog
 import httpx
 
-settings = get_settings()
+# LAZY: do not call get_settings() at import time.
+# This lets the module be imported even when env vars are missing,
+# so uvicorn can start and show a clear error on startup instead of
+# the vague "Could not import module".
+
 normalizer = WebhookNormalizer()
 state_machine = StateMachine()
 
@@ -45,6 +51,20 @@ app = FastAPI(title="Wax Prep Gateway", version="1.0.0-render")
 
 @app.on_event("startup")
 async def startup():
+    # VALIDATE SETTINGS EARLY with a clear error message.
+    # If env vars are missing, this fails fast with a readable traceback
+    # in the container logs instead of uvicorn's "Could not import module".
+    try:
+        settings = get_settings()
+        logger.info("settings_loaded", environment=settings.ENVIRONMENT)
+    except Exception as e:
+        print("=" * 60, file=sys.stderr)
+        print("FATAL: Failed to load settings. Check your environment variables.", file=sys.stderr)
+        print("=" * 60, file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
+        print("=" * 60, file=sys.stderr)
+        raise SystemExit(1) from e
+
     await init_db()
     asyncio.create_task(background_processor())
     logger.info("gateway_started", environment=settings.ENVIRONMENT)
@@ -72,6 +92,7 @@ async def verify_webhook(
     hub_verify_token: str,
     hub_challenge: str
 ):
+    settings = get_settings()
     if hub_mode != "subscribe":
         raise HTTPException(status_code=400, detail="Invalid mode")
     if hub_verify_token != settings.WHATSAPP_VERIFY_TOKEN:
@@ -82,49 +103,51 @@ async def verify_webhook(
 
 @app.post("/webhook")
 async def receive_webhook(request: Request, db: AsyncSession = Depends(get_db)):
+    settings = get_settings()
+    sec = get_security_manager()
     start_time = time.time()
     raw_body = await request.body()
-    
+
     # IP Check
     client_ip = request.headers.get("x-forwarded-for", request.client.host)
-    if not security.is_ip_allowed(client_ip.split(",")[0].strip()):
+    if not sec.is_ip_allowed(client_ip.split(",")[0].strip()):
         logger.warning("ip_blocked", ip=client_ip)
         raise HTTPException(status_code=403, detail="IP not allowed")
-    
+
     # Signature
     signature = request.headers.get("x-hub-signature-256")
-    if not security.verify_signature(raw_body, signature):
+    if not sec.verify_signature(raw_body, signature):
         logger.warning("signature_invalid", ip=client_ip)
         raise HTTPException(status_code=403, detail="Invalid signature")
-    
+
     # Parse
     try:
         payload = json.loads(raw_body)
     except json.JSONDecodeError:
         raise HTTPException(status_code=400, detail="Invalid JSON")
-    
+
     # Normalize
     normalized = normalizer.normalize(payload)
     if not normalized:
         return JSONResponse(content={"status": "ignored"})
-    
+
     # Rate Limiting
     phone = normalized.get("phone_number", "")
     if not await check_rate_limit(phone):
         logger.warning("rate_limit_hit", phone=phone)
         return JSONResponse(content={"status": "rate_limited"})
-    
+
     # Idempotency
     message_id = normalized.get("message_id", "")
     if not await check_idempotency(message_id):
         logger.info("duplicate_dropped", message_id=message_id)
         return JSONResponse(content={"status": "duplicate"})
-    
+
     # Persist immutable log
-    sealed_payload = security.seal_payload(raw_body.decode())
+    sealed_payload = sec.seal_payload(raw_body.decode())
     stream_type = Classifier.classify(payload)
     stream_name = f"wax:msg:{stream_type}"
-    
+
     event_log = WebhookEvent(
         event_id=message_id or normalized.get("fingerprint"),
         payload_encrypted=sealed_payload,
@@ -133,9 +156,9 @@ async def receive_webhook(request: Request, db: AsyncSession = Depends(get_db)):
     )
     db.add(event_log)
     await db.commit()
-    
+
     # Enqueue for processing
-    sealed_normalized = security.seal_payload(json.dumps(normalized))
+    sealed_normalized = sec.seal_payload(json.dumps(normalized))
     queue_item = MessageQueue(
         event_id=message_id or normalized.get("fingerprint"),
         payload_encrypted=sealed_normalized,
@@ -144,14 +167,14 @@ async def receive_webhook(request: Request, db: AsyncSession = Depends(get_db)):
     )
     db.add(queue_item)
     await db.commit()
-    
+
     logger.info(
         "message_enqueued",
         wax_id=normalized["wax_id"],
         stream=stream_name,
         latency_ms=round((time.time() - start_time) * 1000, 2)
     )
-    
+
     return JSONResponse(content={
         "status": "received",
         "trace_id": normalized.get("trace_id")
@@ -159,43 +182,41 @@ async def receive_webhook(request: Request, db: AsyncSession = Depends(get_db)):
 
 
 async def check_rate_limit(phone_number: str) -> bool:
+    settings = get_settings()
     redis = await get_redis()
     now = time.time()
     window = 60
-    
+
     if redis:
-        # Redis rate limiting (fast)
         pipe = redis.pipeline()
         phone_key = f"rate_limit:phone:{phone_number}"
         global_key = "rate_limit:global"
-        
+
         pipe.zremrangebyscore(phone_key, 0, now - window)
         pipe.zcard(phone_key)
         pipe.zadd(phone_key, {str(now): now})
         pipe.expire(phone_key, window + 1)
-        
+
         pipe.zremrangebyscore(global_key, 0, now - window)
         pipe.zcard(global_key)
         pipe.zadd(global_key, {str(now): now})
         pipe.expire(global_key, window + 1)
-        
+
         results = await pipe.execute()
         phone_count = results[1]
         global_count = results[5]
-        
-        return (phone_count <= settings.RATE_LIMIT_PER_PHONE and 
+
+        return (phone_count <= settings.RATE_LIMIT_PER_PHONE and
                 global_count <= settings.RATE_LIMIT_GLOBAL)
     else:
-        # PostgreSQL fallback rate limiting (slower but works)
         async with AsyncSessionLocal() as session:
-            # This is a simplified fallback - in production use Redis
             return True
 
 
 async def check_idempotency(message_id: str) -> bool:
     if not message_id:
         return True
-    
+
     redis = await get_redis()
     if redis:
         key = f"idempotency:{message_id}"
@@ -205,7 +226,6 @@ async def check_idempotency(message_id: str) -> bool:
         await redis.setex(key, 86400, "1")
         return True
     else:
-        # PostgreSQL fallback
         async with AsyncSessionLocal() as session:
             result = await session.execute(
                 select(WebhookEvent).where(WebhookEvent.event_id == message_id)
@@ -214,14 +234,13 @@ async def check_idempotency(message_id: str) -> bool:
 
 
 async def background_processor():
-    """Background task that runs inside the web process. 
+    """Background task that runs inside the web process.
     Polls DB every 5 seconds for pending messages."""
     logger.info("background_processor_started")
-    
+
     while True:
         try:
             async with AsyncSessionLocal() as session:
-                # Get pending messages
                 result = await session.execute(
                     select(MessageQueue).where(
                         and_(
@@ -231,18 +250,20 @@ async def background_processor():
                     ).order_by(MessageQueue.created_at).limit(5)
                 )
                 pending = result.scalars().all()
-                
+
                 for item in pending:
                     await process_queue_item(session, item)
-                    
+
         except Exception as e:
             logger.error("processor_error", error=str(e))
-        
+
         await asyncio.sleep(5)
 
 
 async def process_queue_item(session: AsyncSession, item: MessageQueue):
-    # Mark as processing
+    settings = get_settings()
+    sec = get_security_manager()
+
     await session.execute(
         update(MessageQueue).where(MessageQueue.id == item.id).values(
             status="processing",
@@ -250,19 +271,16 @@ async def process_queue_item(session: AsyncSession, item: MessageQueue):
         )
     )
     await session.commit()
-    
+
     try:
-        normalized = json.loads(security.unseal_payload(item.payload_encrypted))
-        
-        # Handle status state machine
+        normalized = json.loads(sec.unseal_payload(item.payload_encrypted))
+
         if normalized["event_type"] == "status":
             await handle_status(session, normalized)
-        
-        # Forward to AI team if configured
+
         if settings.AI_TEAM_WEBHOOK_URL:
             await forward_to_ai(normalized)
-        
-        # Mark completed
+
         await session.execute(
             update(MessageQueue).where(MessageQueue.id == item.id).values(
                 status="completed",
@@ -271,13 +289,13 @@ async def process_queue_item(session: AsyncSession, item: MessageQueue):
         )
         await session.commit()
         logger.info("message_processed", event_id=item.event_id, wax_id=normalized.get("wax_id"))
-        
+
     except Exception as e:
         error_str = str(e)
         if item.retry_count < settings.MAX_RETRIES:
-            delay = min(settings.RETRY_BASE_DELAY * (2 ** item.retry_count) + __import__('random').uniform(0, 1), 3600)
+            delay = min(settings.RETRY_BASE_DELAY * (2 ** item.retry_count) + random.uniform(0, 1), 3600)
             next_attempt = datetime.utcnow() + timedelta(seconds=delay)
-            
+
             await session.execute(
                 update(MessageQueue).where(MessageQueue.id == item.id).values(
                     status="retry",
@@ -289,7 +307,6 @@ async def process_queue_item(session: AsyncSession, item: MessageQueue):
             await session.commit()
             logger.warning("message_retry", event_id=item.event_id, attempt=item.retry_count + 1)
         else:
-            # Dead letter
             dead = DeadLetter(
                 event_id=item.event_id,
                 payload_encrypted=item.payload_encrypted,
@@ -298,48 +315,49 @@ async def process_queue_item(session: AsyncSession, item: MessageQueue):
             )
             session.add(dead)
             await session.execute(
-                update(MessageQueue).where(MessageQueue.id == item.id).values(status="dead")
+                update(MessageQueue).where(MessageQueue.id == item.id).values(
+                    status="dead_letter",
+                    processed_at=datetime.utcnow()
+                )
             )
             await session.commit()
-            logger.error("message_dead", event_id=item.event_id, error=error_str)
+            logger.error("message_dead_letter", event_id=item.event_id, error=error_str)
 
 
 async def handle_status(session: AsyncSession, normalized: Dict[str, Any]):
-    result = await session.execute(
+    status = normalized.get("status")
+    phone = normalized.get("phone_number", "")
+    msg_id = normalized.get("message_id", "")
+    timestamp = normalized.get("timestamp", 0)
+
+    existing = await session.execute(
         select(MessageStatus).where(
-            MessageStatus.message_id == normalized["message_id"]
-        ).order_by(MessageStatus.timestamp.desc())
+            and_(
+                MessageStatus.message_id == msg_id,
+                MessageStatus.status == status
+            )
+        )
     )
-    current = result.scalar_one_or_none()
-    current_status = current.status if current else None
-    new_status = normalized["status"]
-    
-    inferences = state_machine.infer_missing_states(current_status, new_status)
-    
-    if state_machine.can_transition(current_status, new_status):
-        for inferred in inferences:
-            session.add(MessageStatus(
-                message_id=normalized["message_id"],
-                phone_number=normalized["phone_number"],
-                status=inferred,
-                timestamp=normalized["timestamp"] - 1
-            ))
-        
-        session.add(MessageStatus(
-            message_id=normalized["message_id"],
-            phone_number=normalized["phone_number"],
-            status=new_status,
-            timestamp=normalized["timestamp"]
-        ))
+    existing = existing.scalar_one_or_none()
+
+    if not existing:
+        new_status = MessageStatus(
+            message_id=msg_id,
+            phone_number=phone,
+            status=status,
+            timestamp=timestamp
+        )
+        session.add(new_status)
         await session.commit()
+        await state_machine.transition(session, normalized)
 
 
 async def forward_to_ai(normalized: Dict[str, Any]):
+    settings = get_settings()
     headers = {"Content-Type": "application/json"}
     if settings.AI_TEAM_API_KEY:
         headers["X-API-Key"] = settings.AI_TEAM_API_KEY
-    headers["X-Trace-ID"] = normalized.get("trace_id", "")
-    
+
     async with httpx.AsyncClient(timeout=30.0) as client:
         response = await client.post(
             settings.AI_TEAM_WEBHOOK_URL,
@@ -347,3 +365,4 @@ async def forward_to_ai(normalized: Dict[str, Any]):
             headers=headers
         )
         response.raise_for_status()
+        logger.info("forwarded_to_ai", wax_id=normalized.get("wax_id"), status=response.status_code)
