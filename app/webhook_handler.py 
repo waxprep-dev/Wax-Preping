@@ -7,8 +7,6 @@ from app.security import security
 
 
 class MessageClassifier:
-    """Deterministic classification of WhatsApp events into streams."""
-    
     STREAM_TEXT = "text"
     STREAM_STATUS = "status"
     STREAM_REACTION = "reaction"
@@ -25,10 +23,9 @@ class MessageClassifier:
         if "messages" in value:
             msg = value["messages"][0]
             msg_type = msg.get("type", "")
-            
             type_map = {
                 "text": cls.STREAM_TEXT,
-                "image": cls.STREAM_UNKNOWN,  # Reserved for future
+                "image": cls.STREAM_UNKNOWN,
                 "audio": cls.STREAM_UNKNOWN,
                 "video": cls.STREAM_UNKNOWN,
                 "document": cls.STREAM_UNKNOWN,
@@ -49,32 +46,25 @@ class MessageClassifier:
 
 
 class WebhookNormalizer:
-    """Transforms chaotic WhatsApp payload into clean, structured event."""
-    
     def normalize(self, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         entry = payload.get("entry", [{}])[0]
         changes = entry.get("changes", [{}])[0]
         value = changes.get("value", {})
         metadata = value.get("metadata", {})
-        
         phone_number_id = metadata.get("phone_number_id")
         
         if "messages" in value:
             return self._normalize_message(value, phone_number_id)
-        
         if "statuses" in value:
             return self._normalize_status(value, phone_number_id)
-        
         return None
     
     def _normalize_message(self, value: Dict, phone_number_id: str) -> Dict[str, Any]:
         msg = value["messages"][0]
         contact = value.get("contacts", [{}])[0]
-        
         phone = msg.get("from", "")
         wax_id = security.generate_wax_id(phone)
         
-        # Content-based idempotency fingerprint
         content = json.dumps(msg.get(msg.get("type", "text"), {}), sort_keys=True)
         fingerprint = hashlib.blake2b(
             f"{phone}:{content}:{msg.get('timestamp', '')}".encode(),
@@ -103,14 +93,13 @@ class WebhookNormalizer:
     def _normalize_status(self, value: Dict, phone_number_id: str) -> Dict[str, Any]:
         status = value["statuses"][0]
         phone = status.get("recipient_id", "")
-        
         return {
             "event_type": "status",
             "wax_id": security.generate_wax_id(phone),
             "phone_number": phone,
             "phone_number_id": phone_number_id,
             "message_id": status.get("id"),
-            "status": status.get("status"),  # sent, delivered, read, failed
+            "status": status.get("status"),
             "timestamp": int(status.get("timestamp", 0)),
             "conversation_id": status.get("conversation", {}).get("id"),
             "error_code": status.get("errors", [{}])[0].get("code") if status.get("errors") else None,
@@ -123,8 +112,6 @@ class WebhookNormalizer:
 
 
 class StateMachine:
-    """Handles out-of-order WhatsApp status updates."""
-    
     VALID_TRANSITIONS = {
         None: ["sent", "failed"],
         "sent": ["delivered", "failed", "read"],
@@ -138,7 +125,6 @@ class StateMachine:
         return new in allowed
     
     def infer_missing_states(self, current: Optional[str], new: str) -> list:
-        """If we receive 'read' but never saw 'delivered', infer it."""
         inferences = []
         if new == "read" and current in [None, "sent"]:
             inferences.append("delivered")
