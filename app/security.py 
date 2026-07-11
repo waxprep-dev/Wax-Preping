@@ -1,0 +1,88 @@
+import hmac
+import hashlib
+import ipaddress
+from typing import Optional
+
+from fastapi import Request, HTTPException
+from cryptography.fernet import Fernet
+
+from app.config import get_settings
+from app.redis_client import get_redis
+
+
+class SecurityManager:
+    def __init__(self):
+        self.settings = get_settings()
+        self.fernet = Fernet(self.settings.ENCRYPTION_KEY.encode())
+    
+    def verify_signature(self, raw_body: bytes, signature_header: Optional[str]) -> bool:
+        if not signature_header:
+            return False
+        
+        expected = hmac.new(
+            self.settings.WHATSAPP_APP_SECRET.encode(),
+            raw_body,
+            hashlib.sha256
+        ).hexdigest()
+        
+        received = signature_header.replace("sha256=", "")
+        
+        return hmac.compare_digest(expected, received)
+    
+    def is_ip_allowed(self, client_ip: str) -> bool:
+        if not self.settings.ALLOWED_IP_RANGES:
+            return True
+        
+        try:
+            client = ipaddress.ip_address(client_ip)
+            for cidr in self.settings.ALLOWED_IP_RANGES:
+                if client in ipaddress.ip_network(cidr, strict=False):
+                    return True
+            return False
+        except ValueError:
+            return False
+    
+    def seal_payload(self, payload: str) -> str:
+        return self.fernet.encrypt(payload.encode()).decode()
+    
+    def unseal_payload(self, sealed: str) -> str:
+        return self.fernet.decrypt(sealed.encode()).decode()
+    
+    async def check_rate_limit(self, phone_number: str) -> bool:
+        redis = await get_redis()
+        pipe = redis.pipeline()
+        
+        now = __import__('time').time()
+        window = 60
+        
+        # Per-phone bucket
+        phone_key = f"rate_limit:phone:{phone_number}"
+        pipe.zremrangebyscore(phone_key, 0, now - window)
+        pipe.zcard(phone_key)
+        pipe.zadd(phone_key, {str(now): now})
+        pipe.expire(phone_key, window + 1)
+        
+        # Global bucket
+        global_key = "rate_limit:global"
+        pipe.zremrangebyscore(global_key, 0, now - window)
+        pipe.zcard(global_key)
+        pipe.zadd(global_key, {str(now): now})
+        pipe.expire(global_key, window + 1)
+        
+        results = await pipe.execute()
+        phone_count = results[1]
+        global_count = results[5]
+        
+        return (phone_count <= self.settings.RATE_LIMIT_PER_PHONE and 
+                global_count <= self.settings.RATE_LIMIT_GLOBAL)
+    
+    def generate_wax_id(self, phone_number: str) -> str:
+        # Deterministic, non-reversible, portable
+        # Hash of phone + secret + fixed salt
+        # Same phone always gives same Wax ID across all platforms
+        raw = f"{phone_number}:{self.settings.WHATSAPP_APP_SECRET}:wax_v1"
+        hash_bytes = hashlib.blake2b(raw.encode(), digest_size=16).hexdigest()
+        return f"wx_{hash_bytes}"
+
+
+security = SecurityManager()
