@@ -1,5 +1,5 @@
 from functools import lru_cache
-from typing import List, Optional
+from typing import Optional, List
 
 from pydantic_settings import BaseSettings
 from pydantic import Field, field_validator
@@ -16,16 +16,19 @@ class Settings(BaseSettings):
     
     ENCRYPTION_KEY: str = Field(...)
     
-    # SQLite for broke mode. Change to PostgreSQL when you have money.
-    DATABASE_URL: str = Field(default="sqlite+aiosqlite:///./wax.db")
+    # Neon PostgreSQL
+    DATABASE_URL: str = Field(default="postgresql+asyncpg://user:pass@host.neon.tech/db?ssl=require")
     
-    # AI Team endpoint (leave empty if not ready yet)
+    # Upstash Redis (optional but recommended)
+    REDIS_URL: Optional[str] = Field(default=None)
+    
+    # AI Team (leave empty until ready)
     AI_TEAM_WEBHOOK_URL: Optional[str] = Field(default=None)
     AI_TEAM_API_KEY: Optional[str] = Field(default=None)
     MAX_RETRIES: int = Field(default=5)
     RETRY_BASE_DELAY: float = Field(default=2.0)
     
-    ENVIRONMENT: str = Field(default="development")
+    ENVIRONMENT: str = Field(default="production")
     LOG_LEVEL: str = Field(default="INFO")
     
     @field_validator("ALLOWED_IP_RANGES", mode="before")
