@@ -54,7 +54,3 @@ class SecurityManager:
 def get_security_manager() -> SecurityManager:
     """Lazy singleton so SecurityManager is only created when first used."""
     return SecurityManager()
-
-
-# Backward-compatible alias
-security = get_security_manager()
