@@ -1,74 +1,125 @@
-// The event bus is the nervous system of WaxPrep.
-// Modules do NOT call each other directly.
-// They fire events and trust the bus to deliver them.
-// This starts simple (in-memory async), can become Redis Streams later
-// without changing any module code.
-
-import { EventEmitter } from "events";
-import { v4 as uuidv4 } from "uuid";
-import type { AnyEvent, EventType } from "../types/events";
+import { createClient, RedisClientType } from 'redis';
+import { v4 as uuidv4 } from 'uuid';
+import type { AnyEvent, EventType } from '../types/events';
+import { logger } from '../middleware/logger';
 
 type EventHandler<T extends AnyEvent = AnyEvent> = (event: T) => Promise<void>;
 
-class EventBus {
-  private emitter: EventEmitter;
-  private eventLog: AnyEvent[] = [];
+class PersistentEventBus {
+  private publisher: RedisClientType;
+  private subscriber: RedisClientType;
+  private handlers: Map<string, EventHandler[]> = new Map();
+  private fallbackHandlers: Map<string, EventHandler[]> = new Map();
+  private useFallback = false;
 
   constructor() {
-    this.emitter = new EventEmitter();
-    this.emitter.setMaxListeners(50);
+    const redisUrl = process.env.REDIS_URL || 'redis://localhost:6379';
+    this.publisher = createClient({ url: redisUrl }) as RedisClientType;
+    this.subscriber = createClient({ url: redisUrl }) as RedisClientType;
   }
 
-  async publish(event: Omit<AnyEvent, "id"> & { id?: string }): Promise<void> {
-    const fullEvent = {
-      ...event,
-      id: event.id || uuidv4(),
-    } as AnyEvent;
+  async connect(): Promise<void> {
+    try {
+      await this.publisher.connect();
+      await this.subscriber.connect();
 
-    this.eventLog.push(fullEvent);
-
-    // Fire and forget — handlers run asynchronously
-    // This means the publisher does NOT wait for handlers to complete
-    setImmediate(() => {
-      this.emitter.emit(fullEvent.type, fullEvent);
-    });
-  }
-
-  subscribe<T extends AnyEvent>(
-    eventType: EventType | EventType[],
-    handler: EventHandler<T>
-  ): () => void {
-    const types = Array.isArray(eventType) ? eventType : [eventType];
-    const wrappedHandler = async (event: T) => {
+      // Set up consumer group for reliable delivery
       try {
-        await handler(event);
-      } catch (err) {
-        console.error(`[EventBus] Handler error for ${event.type}:`, err);
+        await this.publisher.xGroupCreate('waxprep:events', 'tutors', '$', { MKSTREAM: true });
+      } catch {
+        // Group already exists — that's fine
+      }
+
+      // Start consuming from the stream
+      this.startConsuming();
+      logger.info('[EventBus] Connected to Redis Streams');
+    } catch (err) {
+      logger.warn('[EventBus] Redis unavailable — falling back to in-memory');
+      this.useFallback = true;
+    }
+  }
+
+  async publish(event: Omit<AnyEvent, 'id'> & { id?: string }): Promise<void> {
+    const fullEvent = { ...event, id: event.id || uuidv4() } as AnyEvent;
+
+    if (this.useFallback) {
+      this.deliverToHandlers(fullEvent);
+      return;
+    }
+
+    try {
+      await this.publisher.xAdd('waxprep:events', '*', {
+        type: fullEvent.type,
+        payload: JSON.stringify(fullEvent),
+      });
+    } catch {
+      this.deliverToHandlers(fullEvent);
+    }
+  }
+
+  private async startConsuming(): Promise<void> {
+    const consume = async () => {
+      while (true) {
+        try {
+          const messages = await this.subscriber.xReadGroup(
+            'tutors',
+            `worker-${process.pid}`,
+            [{ key: 'waxprep:events', id: '>' }],
+            { COUNT: 10, BLOCK: 1000 }
+          );
+
+          if (!messages) continue;
+
+          for (const stream of messages) {
+            for (const msg of stream.messages) {
+              const event = JSON.parse(msg.message.payload) as AnyEvent;
+              this.deliverToHandlers(event);
+              await this.subscriber.xAck('waxprep:events', 'tutors', msg.id);
+            }
+          }
+        } catch (err) {
+          logger.error('[EventBus] Consumer error:', err);
+          await new Promise(r => setTimeout(r, 1000));
+        }
       }
     };
 
-    types.forEach((type) => {
-      this.emitter.on(type, wrappedHandler);
+    consume().catch(err => logger.error('[EventBus] Consumer fatal:', err));
+  }
+
+  private deliverToHandlers(event: AnyEvent): void {
+    const handlers = this.handlers.get(event.type) || [];
+    const wildcardHandlers = this.handlers.get('*') || [];
+
+    for (const handler of [...handlers, ...wildcardHandlers]) {
+      setImmediate(async () => {
+        try {
+          await handler(event);
+        } catch (err) {
+          logger.error(`[EventBus] Handler error for ${event.type}:`, err);
+        }
+      });
+    }
+  }
+
+  subscribe<T extends AnyEvent>(
+    eventType: EventType | EventType[] | '*',
+    handler: EventHandler<T>
+  ): () => void {
+    const types = Array.isArray(eventType) ? eventType : [eventType];
+
+    types.forEach(type => {
+      const existing = this.handlers.get(type) || [];
+      this.handlers.set(type, [...existing, handler as EventHandler]);
     });
 
-    // Return an unsubscribe function
     return () => {
-      types.forEach((type) => {
-        this.emitter.off(type, wrappedHandler);
+      types.forEach(type => {
+        const existing = this.handlers.get(type) || [];
+        this.handlers.set(type, existing.filter(h => h !== handler));
       });
     };
   }
-
-  getEventLog(): AnyEvent[] {
-    return [...this.eventLog];
-  }
-
-  getRecentEvents(studentId: string, limit = 20): AnyEvent[] {
-    return this.eventLog
-      .filter((e) => e.studentId === studentId)
-      .slice(-limit);
-  }
 }
 
-// Singleton — one bus for the whole application
-export const eventBus = new EventBus();
+export const eventBus = new PersistentEventBus();
