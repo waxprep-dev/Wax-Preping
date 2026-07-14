@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: waxprep
+    name: waxprep-api
     runtime: node
     buildCommand: npm install && npm run build
     startCommand: node dist/index.js
@@ -19,14 +19,67 @@ services:
         sync: false
       - key: GROQ_API_KEY
         sync: false
+      - key: OPENROUTER_API_KEY
+        sync: false
+      - key: ZAI_API_KEY
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: HF_API_KEY
+        sync: false
+      - key: BRAVE_SEARCH_API_KEY
+        sync: false
+      - key: TAVILY_API_KEY
+        sync: false
+      - key: ELEVENLABS_API_KEY
+        sync: false
       - key: DATABASE_URL
         fromDatabase:
           name: waxprep-db
           property: connectionString
+      - key: REDIS_URL
+        fromService:
+          name: waxprep-redis
+          type: redis
+          property: connectionString
     healthCheckPath: /health
+
+  - type: worker
+    name: waxprep-message-worker
+    runtime: node
+    buildCommand: npm install && npm run build
+    startCommand: node dist/workers/message_worker.js
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: DATABASE_URL
+        fromDatabase:
+          name: waxprep-db
+          property: connectionString
+      - key: REDIS_URL
+        fromService:
+          name: waxprep-redis
+          type: redis
+          property: connectionString
+
+  - type: worker
+    name: waxprep-spaced-rep
+    runtime: node
+    buildCommand: npm install && npm run build
+    startCommand: node dist/workers/spaced_repetition.js
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: DATABASE_URL
+        fromDatabase:
+          name: waxprep-db
+          property: connectionString
 
 databases:
   - name: waxprep-db
     plan: free
     databaseName: waxprep
-    user: waxprep
+
+  - name: waxprep-redis
+    plan: free
+    type: redis
