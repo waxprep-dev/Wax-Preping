@@ -1,97 +1,116 @@
-// Episodic memory: the tutor's memory of past conversations.
-// Stored in PostgreSQL with pgvector for semantic search.
-// The tutor can recall relevant past moments even without the student mentioning them.
+import { db } from '../db/client';
+import { embed } from './embeddings';
+import type { ConversationTurn } from '../types/student';
 
-import { db } from "../db/client";
-import type { ConversationTurn } from "../types/student";
-
-// This is a lightweight local embedding using character-level hashing.
-// Replace with a real embedding model (HuggingFace, OpenAI, etc.) in production.
-// The interface is the same. Only this function changes.
-async function embed(text: string): Promise<number[]> {
-  // Placeholder: returns a 384-dim zero vector
-  // In production: call HuggingFace inference API or local model
-  // e.g., GET https://api-inference.huggingface.co/pipeline/feature-extraction/sentence-transformers/all-MiniLM-L6-v2
-  const dim = 384;
-  const vector = new Array(dim).fill(0);
-
-  // Simple hashing to make it non-zero for testing
-  for (let i = 0; i < Math.min(text.length, dim); i++) {
-    vector[i] = text.charCodeAt(i) / 255;
-  }
-
-  return vector;
-}
-
-// Save a turn to episodic memory with its semantic embedding
 export async function saveEpisode(turn: ConversationTurn): Promise<void> {
   const textToEmbed = `${turn.studentMessage} ${turn.tutorResponse}`;
   const embedding = await embed(textToEmbed);
-  const embeddingStr = `[${embedding.join(",")}]`;
+  const embeddingStr = `[${embedding.join(',')}]`;
 
   await db.query(
     `INSERT INTO conversation_turns (
       turn_id, session_id, student_id, turn_number,
       student_message, tutor_response, emotional_snapshot,
-      planner_force, model_used, latency_ms, tokens_in,
-      tokens_out, cost_usd, tools_used, embedding, timestamp
-    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15::vector,$16)
+      planner_force, modality, model_used, latency_ms, tokens_in,
+      tokens_out, cost_usd, tools_used, embedding, topic, subject,
+      mastery_evidenced, timestamp
+    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16::vector,$17,$18,$19,$20)
     ON CONFLICT (turn_id) DO NOTHING`,
     [
-      turn.turnId,
-      turn.sessionId,
-      turn.studentId,
-      turn.turnNumber,
-      turn.studentMessage,
-      turn.tutorResponse,
+      turn.turnId, turn.sessionId, turn.studentId, turn.turnNumber,
+      turn.studentMessage, turn.tutorResponse,
       JSON.stringify(turn.emotionalSnapshot),
       turn.plannerForce ? JSON.stringify(turn.plannerForce) : null,
-      turn.modelUsed,
-      turn.latencyMs,
-      turn.tokensIn,
-      turn.tokensOut,
-      turn.costUsd,
-      turn.toolsUsed,
-      embeddingStr,
+      turn.modality || 'text', turn.modelUsed,
+      turn.latencyMs, turn.tokensIn, turn.tokensOut, turn.costUsd,
+      turn.toolsUsed, embeddingStr,
+      turn.topic || null, turn.subject || null,
+      turn.masteryEvidenced || false,
       turn.timestamp,
     ]
   );
 }
 
-// Recall semantically relevant past moments for a student
 export async function recallRelevantEpisodes(
   studentId: string,
   query: string,
   limit = 5
 ): Promise<ConversationTurn[]> {
   const embedding = await embed(query);
-  const embeddingStr = `[${embedding.join(",")}]`;
+  const embeddingStr = `[${embedding.join(',')}]`;
 
   const result = await db.query(
     `SELECT *, 1 - (embedding <=> $1::vector) AS similarity
      FROM conversation_turns
-     WHERE student_id = $2
-       AND embedding IS NOT NULL
+     WHERE student_id = $2 AND embedding IS NOT NULL
      ORDER BY similarity DESC
      LIMIT $3`,
     [embeddingStr, studentId, limit]
   );
 
-  return result.rows.map((row) => ({
-    turnId: row.turn_id,
-    sessionId: row.session_id,
-    studentId: row.student_id,
-    turnNumber: row.turn_number,
-    studentMessage: row.student_message,
-    tutorResponse: row.tutor_response,
-    emotionalSnapshot: row.emotional_snapshot,
-    plannerForce: row.planner_force,
-    modelUsed: row.model_used,
-    latencyMs: row.latency_ms,
-    tokensIn: row.tokens_in,
-    tokensOut: row.tokens_out,
-    costUsd: row.cost_usd,
-    toolsUsed: row.tools_used || [],
-    timestamp: row.timestamp,
+  return mapRows(result.rows);
+}
+
+export async function recallByTopic(
+  studentId: string,
+  topic: string,
+  limit = 10
+): Promise<ConversationTurn[]> {
+  const result = await db.query(
+    `SELECT * FROM conversation_turns
+     WHERE student_id = $1 AND topic ILIKE $2
+     ORDER BY timestamp DESC LIMIT $3`,
+    [studentId, `%${topic}%`, limit]
+  );
+  return mapRows(result.rows);
+}
+
+export async function recallMasteryMoments(
+  studentId: string,
+  limit = 5
+): Promise<ConversationTurn[]> {
+  const result = await db.query(
+    `SELECT * FROM conversation_turns
+     WHERE student_id = $1 AND mastery_evidenced = TRUE
+     ORDER BY timestamp DESC LIMIT $2`,
+    [studentId, limit]
+  );
+  return mapRows(result.rows);
+}
+
+export async function getRecentHistory(
+  sessionId: string,
+  limit = 12
+): Promise<ConversationTurn[]> {
+  const result = await db.query(
+    `SELECT * FROM conversation_turns
+     WHERE session_id = $1
+     ORDER BY turn_number DESC LIMIT $2`,
+    [sessionId, limit]
+  );
+  return mapRows(result.rows).reverse();
+}
+
+function mapRows(rows: Record<string, unknown>[]): ConversationTurn[] {
+  return rows.map(row => ({
+    turnId: row.turn_id as string,
+    sessionId: row.session_id as string,
+    studentId: row.student_id as string,
+    turnNumber: row.turn_number as number,
+    studentMessage: row.student_message as string,
+    tutorResponse: row.tutor_response as string,
+    emotionalSnapshot: row.emotional_snapshot as ConversationTurn['emotionalSnapshot'],
+    plannerForce: row.planner_force as ConversationTurn['plannerForce'],
+    modality: (row.modality as string) || 'text',
+    modelUsed: row.model_used as string,
+    latencyMs: row.latency_ms as number,
+    tokensIn: row.tokens_in as number,
+    tokensOut: row.tokens_out as number,
+    costUsd: (row.cost_usd as number) || 0,
+    toolsUsed: (row.tools_used as string[]) || [],
+    topic: row.topic as string | undefined,
+    subject: row.subject as string | undefined,
+    masteryEvidenced: (row.mastery_evidenced as boolean) || false,
+    timestamp: new Date(row.timestamp as string),
   }));
 }
