@@ -1,4 +1,4 @@
--- WaxPrep v2.0 — one-time database setup
+-- WaxPrep v1.0 — one-time database setup
 -- The app also runs initializeDatabase() on startup, which is idempotent and
 -- handles everything below including v1→v2 migrations (ALTER IF NOT EXISTS).
 

@@ -5,7 +5,7 @@
  * WhatsApp message. One smart-tier call. The plan is rendered as compact
  * instructions; the generation prompt (DB-evolvable) governs voice.
  *
- * v2.1: plan brief now carries hard question budget + teach-content flags
+ * v1: plan brief now carries hard question budget + teach-content flags
  * so the model cannot "helpfully" append a quiz when policy forbids it.
  */
 import { routeAndCall } from '../llm/router';

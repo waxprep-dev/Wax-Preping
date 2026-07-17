@@ -6,7 +6,7 @@
  * teach this turn — then the teach-first policy engine hard-constrains the
  * plan so the model cannot default to endless interrogation.
  *
- * v2.1: policy engine runs BEFORE and AFTER the LLM call.
+ * v1: policy engine runs BEFORE and AFTER the LLM call.
  * - Before: situation brief includes the hard move (teach vs ask).
  * - After: applyPolicyToPlan enforces askQuestion / strategy / mustInclude.
  * - Fallback: policy-driven defaults (no longer "ask almost always").

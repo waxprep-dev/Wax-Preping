@@ -1,6 +1,6 @@
 /**
  * Offline simulation of the teach-first policy against the real WhatsApp
- * transcript that motivated v2.1. No LLM / DB required.
+ * transcript that motivated v1. No LLM / DB required.
  */
 import {
   decideTeachingPolicy,
@@ -92,7 +92,7 @@ let turn = 0;
 
 const failures: string[] = [];
 
-console.log('=== WaxPrep v2.1 teach-first policy simulation ===\n');
+console.log('=== WaxPrep v1 teach-first policy simulation ===\n');
 
 for (const row of transcript) {
   const perception = basePerception(row.student, row.intent);

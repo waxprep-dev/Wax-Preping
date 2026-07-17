@@ -1,4 +1,4 @@
-# WaxPrep v2.1 — Teach-First Teaching Engine
+# WaxPrep v1 — Teach-First Teaching Engine
 
 ## Why this release exists
 
@@ -14,7 +14,7 @@ That is the opposite of elite human tutoring.
 
 ## Research grounding
 
-| Principle | Source | Application in v2.1 |
+| Principle | Source | Application in v1 |
 |---|---|---|
 | Explicit / Direct Instruction for novices | Rosenshine; Engelmann DI | When foundation is weak or student is ready → micro-chunk teaching, not Socratic grilling |
 | Cognitive Load Theory | Sweller | Low foundation / high load → cut interrogation, increase structured explanation |
@@ -82,4 +82,4 @@ Critical checks that must pass on the sample transcript:
 
 ## What this is not (yet)
 
-Full multi-agent infrastructure rewrite, BKT parameter learning, hierarchical memory consolidation, or multi-region scale-out. Those are next phases. v2.1 deliberately fixes the **student-facing teaching failure** first — the only failure that made a real student say bye after six minutes of interrogation.
+Full multi-agent infrastructure rewrite, BKT parameter learning, hierarchical memory consolidation, or multi-region scale-out. Those are next phases. v1 deliberately fixes the **student-facing teaching failure** first — the only failure that made a real student say bye after six minutes of interrogation.

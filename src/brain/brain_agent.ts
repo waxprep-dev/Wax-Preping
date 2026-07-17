@@ -123,7 +123,7 @@ State: ${state.totalStudents} students, ${state.examTomorrow.length} exam tomorr
 
 async function start(): Promise<void> {
   await initializeDatabase();
-  logger.info('[BrainAgent] Starting Backend Brain — WaxPrep v2.0.0');
+  logger.info('[BrainAgent] Starting Backend Brain — WaxPrep v1.0.0');
 
   await runLoop().catch(err => logger.error({ err }, '[BrainAgent] Loop error'));
   setInterval(() => runLoop().catch(err => logger.error({ err }, '[BrainAgent] Loop error')), LOOP_INTERVAL_MS);

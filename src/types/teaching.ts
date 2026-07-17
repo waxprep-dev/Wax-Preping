@@ -88,7 +88,7 @@ export interface TeachingPlan {
   relationshipStage: 'new' | 'familiar' | 'established';
   needsTools: string[];
   expectedOutcome: string;
-  /** v2.1 teach-first policy move (set by policy engine). */
+  /** v1 teach-first policy move (set by policy engine). */
   policyMove?: string;
   mustTeachContent?: boolean;
   maxQuestionsThisTurn?: 0 | 1;

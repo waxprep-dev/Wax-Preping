@@ -1,5 +1,5 @@
 /**
- * WaxPrep v2.0 — main server.
+ * WaxPrep v1.0 — main server.
  *
  * Boot order (unchanged from v1, which was correct): HTTP first so the
  * platform healthcheck passes immediately, then DB, event bus, and brain
@@ -43,7 +43,7 @@ async function main(): Promise<void> {
   app.get('/health', (_req, res) => {
     res.json({
       status: 'ok',
-      version: '2.0.0',
+      version: '1.0.0',
       brain: brainOnline ? 'online' : 'cloud-fallback',
       router: routerOnline ? 'online' : 'cloud-fallback',
       uptime: process.uptime(),
@@ -175,7 +175,7 @@ async function main(): Promise<void> {
       ]);
 
       res.json({
-        version: '2.0.0',
+        version: '1.0.0',
         totalStudents: parseInt(students.rows[0].count),
         sessionsLast24h: parseInt(sessions.rows[0].count),
         turnsLast24h: parseInt(turns.rows[0].count),
