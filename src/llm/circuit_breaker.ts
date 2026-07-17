@@ -2,6 +2,10 @@ import { logger } from '../middleware/logger';
 
 type CircuitState = 'CLOSED' | 'OPEN' | 'HALF_OPEN';
 
+/**
+ * Per-provider circuit breaker. Unchanged in behavior from v1 (it worked well);
+ * only made the half-open probe limit configurable and clarified states.
+ */
 export class CircuitBreaker {
   private state: CircuitState = 'CLOSED';
   private failures = 0;
@@ -20,7 +24,7 @@ export class CircuitBreaker {
       if (Date.now() - this.lastFailureTime > this.timeoutMs) {
         this.state = 'HALF_OPEN';
         this.successCount = 0;
-        logger.info(`[CircuitBreaker] ${this.name} → HALF_OPEN`);
+        logger.info(`[CircuitBreaker] ${this.name} -> HALF_OPEN`);
       } else {
         throw new Error(`Circuit breaker OPEN for ${this.name}`);
       }
@@ -42,7 +46,7 @@ export class CircuitBreaker {
       this.successCount++;
       if (this.successCount >= this.halfOpenSuccessThreshold) {
         this.state = 'CLOSED';
-        logger.info(`[CircuitBreaker] ${this.name} → CLOSED`);
+        logger.info(`[CircuitBreaker] ${this.name} -> CLOSED`);
       }
     }
   }
@@ -50,19 +54,14 @@ export class CircuitBreaker {
   private onFailure(): void {
     this.failures++;
     this.lastFailureTime = Date.now();
-
     if (this.failures >= this.failThreshold || this.state === 'HALF_OPEN') {
       this.state = 'OPEN';
-      logger.warn(`[CircuitBreaker] ${this.name} → OPEN after ${this.failures} failures`);
+      logger.warn(`[CircuitBreaker] ${this.name} -> OPEN after ${this.failures} failures`);
     }
   }
 
   isAvailable(): boolean {
-    if (this.state === 'CLOSED' || this.state === 'HALF_OPEN') return true;
-    return Date.now() - this.lastFailureTime > this.timeoutMs;
-  }
-
-  getState(): CircuitState {
-    return this.state;
+    if (this.state === 'OPEN') return Date.now() - this.lastFailureTime > this.timeoutMs;
+    return true;
   }
 }

@@ -1,3 +1,20 @@
+/**
+ * Student-domain types: profiles, memory, sessions, concept progress.
+ *
+ * v2.0 changes:
+ * - ConceptProgress gains BKT-inspired evidence counters (successCount,
+ *   attemptCount, bloomLevel) so mastery is computed from accumulated
+ *   evidence, not overwritten by a single LLM judgment.
+ * - WorkingMemorySnapshot is now hydrated from the persisted session_state
+ *   row (survives restarts) merged with recent turns.
+ * - Added StudentFact: structured, extracted facts about the learner that the
+ *   student-model updater writes after every turn. This is what makes the
+ *   profile actually learn (in v1 the memory blocks stayed at their defaults
+ *   forever for most students).
+ * - PedagogicalIntent is superseded by PerceptionResult (types/teaching.ts)
+ *   but kept for encoder backward compatibility.
+ */
+
 export interface EmotionalSnapshot {
   valence: number;
   arousal: number;
@@ -11,32 +28,49 @@ export interface EmotionalSnapshot {
   excitement: number;
 }
 
-// The AI generates this — not a code function
-export interface AIAnalysis {
-  emotionalReading: EmotionalSnapshot;
+export interface PedagogicalIntent {
   primaryIntent: string;
   hasMisconception: boolean;
-  misconceptionDescription: string;
-  inferredTopic: string;
-  inferredSubject: string;
+  misconceptionDescription?: string;
+  inferredTopic?: string;
+  inferredSubject?: string;
   inferredKnowledgeLevel: number;
   temporalPressure: string;
+  rawMessage: string;
+  emotionalSignals: EmotionalSnapshot;
+  messageLength: number;
+  containsQuestion: boolean;
   languageStyle: string;
-  pedagogicalStrategy: string;
-  warmthLevel: number;
-  scaffoldingLevel: number;
-  pacing: number;
-  useAnalogy: boolean;
-  socratic: boolean;
-  checkIn: boolean;
-  hintLevel: number;
-  shouldSearch: boolean;
-  searchQuery: string;
-  masterySignalDetected: boolean;
-  masteryEvidenceType: string;
-  cognitiveLoad: string;
-  sessionPhase: string;
-  stuckDetected: boolean;
+  isRepeatedQuestion: boolean;
+  repetitionCount: number;
+  [key: string]: unknown;
+}
+
+export interface AIAnalysis {
+  emotionalReading?: Partial<EmotionalSnapshot> & { dominantEmotion?: string };
+  primaryIntent?: string;
+  hasMisconception?: boolean;
+  misconceptionDescription?: string;
+  inferredTopic?: string;
+  inferredSubject?: string;
+  inferredKnowledgeLevel?: number;
+  temporalPressure?: string;
+  languageStyle?: string;
+  pedagogicalStrategy?: string;
+  shouldSearch?: boolean;
+  searchQuery?: string;
+  cognitiveLoad?: string;
+  sessionPhase?: string;
+  stuckDetected?: boolean;
+  masterySignalDetected?: boolean;
+  masteryEvidenceType?: string;
+  bloomLevel?: string;
+}
+
+export interface SalientTurn {
+  role: 'student' | 'tutor';
+  content: string;
+  salienceScore: number;
 }
 
 export interface WorkingMemorySnapshot {
@@ -53,46 +87,24 @@ export interface WorkingMemorySnapshot {
   approachesAttempted: string[];
   conceptsVisitedThisSession: string[];
   hintLevelCurrent: number;
+  lastScaffoldUsed?: string | null;
+  lastPaceUsed?: string | null;
+  lastStrategy?: string | null;
+  bloomLevel?: string | null;
+  [key: string]: unknown;
 }
 
-export interface SalientTurn {
-  role: 'student' | 'tutor';
-  content: string;
-  salienceScore: number;
+export type BeliefStatus = 'MASTERS' | 'UNDERSTANDS' | 'CONFUSES' | 'HAS_NOT_SEEN';
+
+export interface SymbolicBelief {
+  claim: string;
+  status: BeliefStatus;
+  confidence: 'high' | 'medium' | 'low';
+  evidence: string;
+  updatedAt: Date;
 }
 
-export interface StudentProfile {
-  studentId: string;
-  createdAt: Date;
-  lastSeenAt: Date;
-  totalSessions: number;
-  totalTurns: number;
-  studyStreak: number;
-  lastStudyDate: Date | null;
-  examTargets: ExamTarget[];
-  culturalContext: CulturalContext;
-  conceptProgress: Record<string, ConceptProgress>;
-  errorDiary: ErrorEntry[];
-  analogyLibrary: AnalogyEntry[];
-  memoryBlocks: MemoryBlocks;
-  studyPlan?: StudyPlan;
-}
-
-export interface ExamTarget {
-  examType: string;
-  examDate?: Date;
-  subjects: string[];
-  targetScore?: number;
-}
-
-export interface CulturalContext {
-  country: string;
-  region: string;
-  language: string;
-  currency: string;
-  examBoards: string[];
-  timezone: string;
-}
+export type BloomLevel = 'remember' | 'understand' | 'apply' | 'analyze' | 'evaluate' | 'create';
 
 export interface ConceptProgress {
   conceptId: string;
@@ -107,15 +119,10 @@ export interface ConceptProgress {
   nextReviewAt?: Date;
   reviewInterval: number;
   reviewCount: number;
-}
-
-// Neural-symbolic knowledge representation
-export interface SymbolicBelief {
-  claim: string;
-  status: 'UNDERSTANDS' | 'CONFUSES' | 'HAS_NOT_SEEN' | 'MASTERS';
-  confidence: 'high' | 'medium' | 'low';
-  evidence: string;
-  updatedAt: Date;
+  successCount: number;
+  attemptCount: number;
+  bloomLevel: BloomLevel;
+  lastResult?: 'success' | 'struggle' | 'neutral';
 }
 
 export interface ErrorEntry {
@@ -144,6 +151,32 @@ export interface MemoryBlocks {
   examStrategy: string;
   errorPatterns: string;
   breakthroughs: string;
+  [key: string]: string;
+}
+
+export interface CulturalContext {
+  country: string;
+  region: string;
+  language: string;
+  currency: string;
+  examBoards: string[];
+  timezone: string;
+  [key: string]: unknown;
+}
+
+export interface ExamTarget {
+  examType: string;
+  examDate?: string;
+  subjects: string[];
+  targetScore?: number;
+}
+
+export interface WeeklyTarget {
+  week: number;
+  concepts: string[];
+  isCompleted: boolean;
+  focus?: string;
+  rationale?: string;
 }
 
 export interface StudyPlan {
@@ -154,10 +187,30 @@ export interface StudyPlan {
   currentWeek: number;
 }
 
-export interface WeeklyTarget {
-  week: number;
-  concepts: string[];
-  isCompleted: boolean;
+export interface StudentFact {
+  factKey: string;
+  factValue: string;
+  confidence: number;
+  source: string;
+  updatedAt: Date;
+}
+
+export interface StudentProfile {
+  studentId: string;
+  createdAt: Date;
+  lastSeenAt: Date;
+  totalSessions: number;
+  totalTurns: number;
+  studyStreak: number;
+  lastStudyDate: Date | null;
+  examTargets: ExamTarget[];
+  culturalContext: CulturalContext;
+  conceptProgress: Record<string, ConceptProgress>;
+  errorDiary: ErrorEntry[];
+  analogyLibrary: AnalogyEntry[];
+  memoryBlocks: MemoryBlocks;
+  facts: Record<string, StudentFact>;
+  studyPlan?: StudyPlan;
 }
 
 export interface ConversationTurn {
@@ -189,4 +242,22 @@ export interface Session {
   lastActivityAt: Date;
   turnCount: number;
   isActive: boolean;
+  state: SessionState;
+  isNewSession: boolean;
+}
+
+/**
+ * Persistent per-session teaching state. This is what lets the tutor behave
+ * consistently within a conversation without re-deriving everything from
+ * regexes over the transcript on every turn (the v1 approach).
+ */
+export interface SessionState {
+  currentConcept: string | null;
+  currentSubject: string | null;
+  hintLevel: number;
+  approachesTried: string[];
+  struggleCount: number;
+  lastStrategy: string | null;
+  bloomLevel: BloomLevel | null;
+  unresolvedQuestion: string | null;
 }

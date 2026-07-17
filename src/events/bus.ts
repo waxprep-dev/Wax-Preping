@@ -5,36 +5,37 @@ import { logger } from '../middleware/logger';
 
 type EventHandler<T extends AnyEvent = AnyEvent> = (event: T) => Promise<void>;
 
-class PersistentEventBus {
-  private publisher: RedisClientType;
-  private subscriber: RedisClientType;
+class EventBus {
+  private publisher: RedisClientType | null = null;
+  private subscriber: RedisClientType | null = null;
   private handlers: Map<string, EventHandler[]> = new Map();
-  private fallbackHandlers: Map<string, EventHandler[]> = new Map();
-  private useFallback = false;
-
-  constructor() {
-    const redisUrl = process.env.REDIS_URL || 'redis://localhost:6379';
-    this.publisher = createClient({ url: redisUrl }) as RedisClientType;
-    this.subscriber = createClient({ url: redisUrl }) as RedisClientType;
-  }
+  private useFallback = true;
 
   async connect(): Promise<void> {
+    const redisUrl = process.env.REDIS_URL;
+    if (!redisUrl) {
+      logger.warn('[EventBus] No REDIS_URL — using in-memory bus');
+      return;
+    }
+
     try {
+      this.publisher = createClient({ url: redisUrl }) as RedisClientType;
+      this.subscriber = createClient({ url: redisUrl }) as RedisClientType;
+
       await this.publisher.connect();
       await this.subscriber.connect();
+      this.useFallback = false;
 
-      // Set up consumer group for reliable delivery
       try {
         await this.publisher.xGroupCreate('waxprep:events', 'tutors', '$', { MKSTREAM: true });
       } catch {
-        // Group already exists — that's fine
+        // Group already exists
       }
 
-      // Start consuming from the stream
       this.startConsuming();
       logger.info('[EventBus] Connected to Redis Streams');
     } catch (err) {
-      logger.warn('[EventBus] Redis unavailable — falling back to in-memory');
+      logger.warn('[EventBus] Redis unavailable — using in-memory fallback');
       this.useFallback = true;
     }
   }
@@ -42,7 +43,7 @@ class PersistentEventBus {
   async publish(event: Omit<AnyEvent, 'id'> & { id?: string }): Promise<void> {
     const fullEvent = { ...event, id: event.id || uuidv4() } as AnyEvent;
 
-    if (this.useFallback) {
+    if (this.useFallback || !this.publisher) {
       this.deliverToHandlers(fullEvent);
       return;
     }
@@ -57,11 +58,13 @@ class PersistentEventBus {
     }
   }
 
-  private async startConsuming(): Promise<void> {
+  private startConsuming(): void {
+    if (!this.subscriber) return;
+
     const consume = async () => {
       while (true) {
         try {
-          const messages = await this.subscriber.xReadGroup(
+          const messages = await this.subscriber!.xReadGroup(
             'tutors',
             `worker-${process.pid}`,
             [{ key: 'waxprep:events', id: '>' }],
@@ -72,31 +75,32 @@ class PersistentEventBus {
 
           for (const stream of messages) {
             for (const msg of stream.messages) {
-              const event = JSON.parse(msg.message.payload) as AnyEvent;
-              this.deliverToHandlers(event);
-              await this.subscriber.xAck('waxprep:events', 'tutors', msg.id);
+              try {
+                const event = JSON.parse(msg.message.payload) as AnyEvent;
+                this.deliverToHandlers(event);
+                await this.subscriber!.xAck('waxprep:events', 'tutors', msg.id);
+              } catch { /* skip malformed */ }
             }
           }
-        } catch (err) {
-          logger.error('[EventBus] Consumer error:', err);
+        } catch {
           await new Promise(r => setTimeout(r, 1000));
         }
       }
     };
 
-    consume().catch(err => logger.error('[EventBus] Consumer fatal:', err));
+    consume().catch(() => {});
   }
 
   private deliverToHandlers(event: AnyEvent): void {
-    const handlers = this.handlers.get(event.type) || [];
-    const wildcardHandlers = this.handlers.get('*') || [];
+    const handlers = [
+      ...(this.handlers.get(event.type) || []),
+      ...(this.handlers.get('*') || []),
+    ];
 
-    for (const handler of [...handlers, ...wildcardHandlers]) {
+    for (const handler of handlers) {
       setImmediate(async () => {
-        try {
-          await handler(event);
-        } catch (err) {
-          logger.error(`[EventBus] Handler error for ${event.type}:`, err);
+        try { await handler(event); } catch (err) {
+          logger.error({ err }, `[EventBus] Handler error for ${event.type}`);
         }
       });
     }
@@ -107,12 +111,10 @@ class PersistentEventBus {
     handler: EventHandler<T>
   ): () => void {
     const types = Array.isArray(eventType) ? eventType : [eventType];
-
     types.forEach(type => {
       const existing = this.handlers.get(type) || [];
       this.handlers.set(type, [...existing, handler as EventHandler]);
     });
-
     return () => {
       types.forEach(type => {
         const existing = this.handlers.get(type) || [];
@@ -122,4 +124,4 @@ class PersistentEventBus {
   }
 }
 
-export const eventBus = new PersistentEventBus();
+export const eventBus = new EventBus();

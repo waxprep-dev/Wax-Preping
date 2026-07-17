@@ -1,12 +1,21 @@
-// The 5-layer adversarial defense system.
-// Runs on every response before it reaches the student.
-// Each layer checks for a different type of failure.
-// Non-critical issues are auto-fixed by the AI.
-// Critical issues are flagged and logged.
-
+/**
+ * The 5-layer adversarial defense system. Runs on every response before it
+ * reaches the student.
+ *
+ * v1 preserved + hardened:
+ * - The prompt-injection fallback string is no longer hardcoded mid-function;
+ *   it comes from the constitution-guided redirect below.
+ * - Auto-fix prompt is now a DB-evolvable component.
+ * - Answer-leak layer gains a context exemption when the TeachingPlan
+ *   explicitly says the student already solved it (verification, not leak).
+ */
+import { v4 as uuidv4 } from 'uuid';
 import { routeAndCall } from '../llm/router';
+import { getPrompt } from '../config/prompts';
 import { db } from '../db/client';
+import { eventBus } from '../events/bus';
 import { logger } from '../middleware/logger';
+import type { DefenseTriggered } from '../types/events';
 
 export interface DefenseResult {
   passes: boolean;
@@ -16,7 +25,8 @@ export interface DefenseResult {
   layerName: string;
 }
 
-// Layer 1: Prompt injection detection
+const INJECTION_REDIRECT = "Let's stay focused on your studies — what are you working on today?";
+
 function checkPromptInjection(message: string): DefenseResult {
   const patterns = [
     /ignore (all |your |the )?(previous|above|prior) (instructions|prompt|system)/i,
@@ -39,8 +49,7 @@ function checkPromptInjection(message: string): DefenseResult {
   };
 }
 
-// Layer 2: Answer leak detection
-function checkAnswerLeak(response: string): DefenseResult {
+function checkAnswerLeak(response: string, studentAlreadySolved: boolean): DefenseResult {
   const leakPatterns = [
     /^(the answer is|answer:) [^\n]+$/im,
     /^(= [0-9\-\.\+]+)$/m,
@@ -50,22 +59,20 @@ function checkAnswerLeak(response: string): DefenseResult {
     /here is (the )?solution: [^\.]{1,50}\./i,
   ];
 
-  // Don't flag if it's clearly a worked example or verification
   const isWorkedExample = /for example|let's say|suppose|imagine|if we had|let me show/i.test(response);
-  const isVerification = /you got it|that's right|exactly|correct! and here's why/i.test(response);
+  const isVerification = /you got it|that's right|exactly|correct!|well done|you nailed/i.test(response);
 
-  const leakDetected = leakPatterns.some(p => p.test(response)) && !isWorkedExample && !isVerification;
+  const leakDetected = leakPatterns.some(p => p.test(response)) && !isWorkedExample && !isVerification && !studentAlreadySolved;
 
   return {
     passes: !leakDetected,
     severity: 'high',
     issue: leakDetected ? 'Response appears to directly reveal a numerical or final answer' : '',
-    suggestedFix: 'Guide student to the answer without stating it. Ask them to try the final step.',
+    suggestedFix: 'Guide the student to the answer without stating it. Ask them to try the final step.',
     layerName: 'answer_leak',
   };
 }
 
-// Layer 3: Emotional harm detection
 function checkEmotionalSafety(response: string): DefenseResult {
   const harmful = [
     /you('re| are) (stupid|dumb|hopeless|careless|slow)/i,
@@ -86,7 +93,6 @@ function checkEmotionalSafety(response: string): DefenseResult {
   };
 }
 
-// Layer 4: Pedagogical integrity
 function checkPedagogicalIntegrity(studentMessage: string, response: string): DefenseResult {
   const doingWorkForStudent = [
     /let me (solve|work|calculate|do) (this|it|that) for you/i,
@@ -96,8 +102,8 @@ function checkPedagogicalIntegrity(studentMessage: string, response: string): De
 
   const askingForAnswer = /(give|tell|show|write) (me )?(the )?(answer|solution|calculation|working)/i.test(studentMessage);
   const doingWork = doingWorkForStudent.some(p => p.test(response));
-
   const issue = doingWork && askingForAnswer;
+
   return {
     passes: !issue,
     severity: 'medium',
@@ -107,7 +113,6 @@ function checkPedagogicalIntegrity(studentMessage: string, response: string): De
   };
 }
 
-// Layer 5: Cultural appropriateness
 function checkCulturalSafety(response: string): DefenseResult {
   const inappropriate = [
     /(christian|muslim|traditional religion) (is wrong|doesn't matter)/i,
@@ -121,31 +126,25 @@ function checkCulturalSafety(response: string): DefenseResult {
     passes: !detected,
     severity: 'critical',
     issue: detected ? 'Response contains culturally inappropriate or demeaning content' : '',
-    suggestedFix: 'Remove generalizations. Be respectful of Nigerian culture and context.',
+    suggestedFix: 'Remove generalizations. Be respectful of the student\'s culture and context.',
     layerName: 'cultural_safety',
   };
 }
 
-// AI-powered auto-fix for non-critical issues
-async function autoFixResponse(
-  originalResponse: string,
-  issue: DefenseResult
-): Promise<string> {
+async function autoFixResponse(originalResponse: string, issue: DefenseResult, studentId?: string): Promise<string> {
   try {
+    const editorPrompt = await getPrompt('defense_autofix.v1');
     const fixResponse = await routeAndCall([
-      {
-        role: 'system',
-        content: `You are a safety editor for an AI tutor serving Nigerian students. Fix the response issue described below while keeping the core educational content and warm Nigerian tone. Do not add "Certainly!" or other forbidden phrases. Just produce the fixed response.`,
-      },
+      { role: 'system', content: editorPrompt },
       {
         role: 'user',
         content: `Original response:\n"${originalResponse}"\n\nIssue: ${issue.issue}\nFix needed: ${issue.suggestedFix}\n\nProvide only the fixed response, nothing else.`,
       },
-    ], { maxTokens: 800 });
+    ], { tier: 'fast', maxTokens: 800, studentId, purpose: 'defense_autofix' });
 
     return fixResponse.content;
   } catch {
-    return originalResponse; // If fix fails, return original
+    return originalResponse;
   }
 }
 
@@ -153,58 +152,70 @@ export async function runDefenseChecks(
   studentMessage: string,
   tutorResponse: string,
   studentId: string,
-  sessionId: string
+  sessionId: string,
+  options: { studentAlreadySolved?: boolean } = {}
 ): Promise<{ passesAll: boolean; issues: DefenseResult[]; finalResponse: string }> {
   const issues: DefenseResult[] = [];
   let currentResponse = tutorResponse;
 
-  // Run all layers
-  const results = [
-    checkPromptInjection(studentMessage),
-    checkAnswerLeak(currentResponse),
-    checkEmotionalSafety(currentResponse),
-    checkPedagogicalIntegrity(studentMessage, currentResponse),
-    checkCulturalSafety(currentResponse),
+  const checks: { run: (response: string, studentMessage: string) => DefenseResult }[] = [
+    { run: (_r, sm) => checkPromptInjection(sm) },
+    { run: r => checkAnswerLeak(r, options.studentAlreadySolved === true) },
+    { run: r => checkEmotionalSafety(r) },
+    { run: (r, sm) => checkPedagogicalIntegrity(sm, r) },
+    { run: r => checkCulturalSafety(r) },
   ];
 
-  for (const result of results) {
-    if (!result.passes) {
-      issues.push(result);
+  for (const check of checks) {
+    const result = check.run(currentResponse, studentMessage);
+    if (result.passes) continue;
 
-      if (result.severity === 'critical') {
-        // For critical issues, log and return a safe fallback
-        logger.warn(`[Defense] CRITICAL: ${result.layerName} — ${result.issue}`);
+    issues.push(result);
 
-        await db.query(
-          `INSERT INTO defense_log (student_id, session_id, layer, severity, issue, original_response, was_fixed)
-           VALUES ($1, $2, $3, $4, $5, $6, FALSE)`,
-          [studentId, sessionId, result.layerName, result.severity, result.issue, tutorResponse.slice(0, 1000)]
-        ).catch(() => {});
+    if (result.severity === 'critical') {
+      logger.warn(`[Defense] CRITICAL: ${result.layerName} — ${result.issue}`);
+      await logDefense(studentId, sessionId, result, currentResponse, null, false);
 
-        if (result.layerName === 'prompt_injection') {
-          currentResponse = "Let's stay focused on your studies. What are you working on today?";
-        } else if (result.layerName === 'emotional_safety') {
-          currentResponse = await autoFixResponse(currentResponse, result);
-        } else if (result.layerName === 'cultural_safety') {
-          currentResponse = await autoFixResponse(currentResponse, result);
-        }
+      if (result.layerName === 'prompt_injection') {
+        currentResponse = INJECTION_REDIRECT;
       } else {
-        // For non-critical, auto-fix
-        logger.info(`[Defense] Auto-fixing: ${result.layerName} — ${result.issue}`);
-        const fixed = await autoFixResponse(currentResponse, result);
-        await db.query(
-          `INSERT INTO defense_log (student_id, session_id, layer, severity, issue, original_response, revised_response, was_fixed)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, TRUE)`,
-          [studentId, sessionId, result.layerName, result.severity, result.issue, tutorResponse.slice(0, 500), fixed.slice(0, 500)]
-        ).catch(() => {});
-        currentResponse = fixed;
+        currentResponse = await autoFixResponse(currentResponse, result, studentId);
       }
+    } else {
+      logger.info(`[Defense] Auto-fixing: ${result.layerName} — ${result.issue}`);
+      const fixed = await autoFixResponse(currentResponse, result, studentId);
+      await logDefense(studentId, sessionId, result, currentResponse, fixed, true);
+      currentResponse = fixed;
     }
   }
 
-  return {
-    passesAll: issues.length === 0,
-    issues,
-    finalResponse: currentResponse,
+  return { passesAll: issues.length === 0, issues, finalResponse: currentResponse };
+}
+
+async function logDefense(
+  studentId: string,
+  sessionId: string,
+  result: DefenseResult,
+  original: string,
+  revised: string | null,
+  wasFixed: boolean
+): Promise<void> {
+  await db.query(
+    `INSERT INTO defense_log (student_id, session_id, layer, severity, issue, original_response, revised_response, was_fixed)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+    [studentId, sessionId, result.layerName, result.severity, result.issue, original.slice(0, 1000), revised?.slice(0, 1000) || null, wasFixed]
+  ).catch(() => {});
+
+  const defenseEvent: DefenseTriggered = {
+    id: uuidv4(),
+    type: 'defense.triggered',
+    studentId,
+    sessionId,
+    timestamp: new Date(),
+    layer: result.layerName,
+    severity: result.severity,
+    issue: result.issue,
+    wasFixed,
   };
+  await eventBus.publish(defenseEvent).catch(() => {});
 }

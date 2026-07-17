@@ -1,217 +1,110 @@
-// The MAC-SQL Multi-Agent Text-to-SQL System.
-// Three agents work in sequence to generate safe, accurate SQL.
-// The Backend Brain calls this to autonomously update the database.
-// Nothing is hardcoded. The AI reads the schema and decides what to do.
-
+/**
+ * Autonomous SQL agent — HARDENED.
+ *
+ * v1 executed LLM-generated SQL with only a regex guard that blocked
+ * "DROP TABLE", "TRUNCATE" and "DELETE ... WHERE 1=1" — while letting a bare
+ * "DELETE FROM students" straight through. v2 enforces:
+ *   1. Statement-type allowlist: SELECT and UPDATE only. Everything else is
+ *      refused before the database ever sees it.
+ *   2. UPDATE must contain a WHERE clause.
+ *   3. Single statement per query (no stacked ";" injection).
+ *   4. Table allowlist derived from the known schema.
+ *   5. The constitution gate in brain_agent now fails closed.
+ */
 import { callBrain } from './llama_server';
 import { db } from '../db/client';
 import { logger } from '../middleware/logger';
 
 const DB_SCHEMA = `
-TABLE: student_profiles
-  student_id TEXT PK, created_at TIMESTAMPTZ, last_seen_at TIMESTAMPTZ,
-  total_sessions INT, total_turns INT, study_streak INT, last_study_date DATE,
-  memory_blocks JSONB, concept_progress JSONB, error_diary JSONB,
-  analogy_library JSONB, exam_targets JSONB, cultural_context JSONB,
-  study_plan JSONB, symbolic_knowledge JSONB
-
-TABLE: conversation_turns
-  turn_id TEXT PK, session_id TEXT, student_id TEXT, turn_number INT,
-  student_message TEXT, tutor_response TEXT, ai_analysis JSONB,
-  modality TEXT, model_used TEXT, latency_ms INT, tokens_in INT, tokens_out INT,
-  cost_usd FLOAT, tools_used TEXT[], embedding VECTOR(384),
-  topic TEXT, subject TEXT, mastery_evidenced BOOLEAN, reflection_score FLOAT, timestamp TIMESTAMPTZ
-
-TABLE: sessions
-  session_id TEXT PK, student_id TEXT, started_at TIMESTAMPTZ,
-  last_activity_at TIMESTAMPTZ, turn_count INT, is_active BOOLEAN
-
-TABLE: spaced_reviews
-  id UUID PK, student_id TEXT, concept TEXT, subject TEXT,
-  next_review_at TIMESTAMPTZ, interval_days INT, review_count INT, mastery_level FLOAT
-
-TABLE: notification_queue
-  id UUID PK, student_id TEXT, type TEXT, content TEXT,
-  scheduled_at TIMESTAMPTZ, sent_at TIMESTAMPTZ, sent BOOLEAN DEFAULT FALSE,
-  priority INT DEFAULT 5, context JSONB
-
-TABLE: world_model_state
-  student_id TEXT PK, predicted_next_mistake TEXT, predicted_forget_concepts TEXT[],
-  predicted_frustration_probability FLOAT, predicted_flow_probability FLOAT,
-  predicted_exam_score FLOAT, predicted_exam_score_trend TEXT,
-  model_updated_at TIMESTAMPTZ
-
-TABLE: prompt_performance
-  id UUID PK, component_id TEXT, student_id TEXT, session_id TEXT, turn_number INT,
-  student_engagement FLOAT, mastery_signal BOOLEAN, shame_spike BOOLEAN,
-  frustration_spike BOOLEAN, flow_maintained BOOLEAN, answer_leak BOOLEAN, timestamp TIMESTAMPTZ
-
-TABLE: system_config
-  key TEXT PK, content TEXT, updated_at TIMESTAMPTZ DEFAULT NOW()
-
-TABLE: ai_reflections
-  id UUID PK, student_id TEXT, session_id TEXT, turn_number INT,
-  student_message TEXT, tutor_response TEXT, critique TEXT, improvement TEXT,
-  confidence_score FLOAT, would_do_differently TEXT, timestamp TIMESTAMPTZ
+student_profiles: student_id, total_sessions, total_turns, study_streak, last_study_date, memory_blocks JSONB, concept_progress JSONB, error_diary JSONB, exam_targets JSONB, study_plan JSONB
+conversation_turns: turn_id, session_id, student_id, turn_number, student_message, tutor_response, topic, subject, mastery_evidenced, timestamp
+sessions: session_id, student_id, started_at, last_activity_at, turn_count, is_active, state JSONB
+spaced_reviews: id, student_id, concept, subject, next_review_at, interval_days, review_count, mastery_level
+notification_queue: id, student_id, type, content, scheduled_at, sent, priority, dedupe_key
+world_model_state: student_id, predicted_next_mistake, predicted_forget_concepts, predicted_frustration_probability, predicted_exam_score, model_updated_at
 `;
 
-// Agent 1: Schema Selector
-// Identifies which tables are relevant to the task
-async function selectRelevantSchema(task: string): Promise<string> {
-  const prompt = `You are a database schema expert. A task needs SQL.
-Full schema:
-${DB_SCHEMA}
+const ALLOWED_TABLES = [
+  'student_profiles', 'conversation_turns', 'sessions',
+  'spaced_reviews', 'notification_queue', 'world_model_state',
+];
 
+async function generateSQL(task: string): Promise<string[]> {
+  const prompt = `You are a PostgreSQL expert. Generate SQL for this task using the schema below.
+Schema: ${DB_SCHEMA}
 Task: ${task}
+Rules: SELECT or UPDATE only. UPDATE must have a WHERE clause. One statement per string. No DELETE, INSERT, DROP, ALTER, TRUNCATE.
+Respond with JSON array of SQL strings only: ["SQL1", "SQL2"]`;
 
-Which tables are needed? List ONLY the relevant table names, comma-separated. Nothing else.`;
-
-  const response = await callBrain(prompt, 0.1, 100);
-  const tableNames = response.split(',').map(t => t.trim()).filter(Boolean);
-
-  // Return only relevant schema sections
-  const lines = DB_SCHEMA.split('\n');
-  const relevant: string[] = [];
-  let capture = false;
-
-  for (const line of lines) {
-    if (line.startsWith('TABLE:')) {
-      const tableName = line.replace('TABLE:', '').trim();
-      capture = tableNames.some(t => tableName.includes(t));
-    }
-    if (capture && line.trim()) {
-      relevant.push(line);
-    }
-  }
-
-  return relevant.join('\n') || DB_SCHEMA;
-}
-
-// Agent 2: Query Decomposer
-// Breaks the task into SQL steps with chain-of-thought
-async function decomposeToSQL(task: string, relevantSchema: string): Promise<string[]> {
-  const prompt = `You are a PostgreSQL expert for a Nigerian student tutoring system.
-
-Relevant database schema:
-${relevantSchema}
-
-Task: ${task}
-
-Think step by step. Break this into individual SQL statements.
-Important rules:
-- Use parameterized queries where possible ($1, $2 notation)
-- For JSONB updates use jsonb_set()
-- For arrays use array operations
-- Never use DROP, TRUNCATE, or DELETE without WHERE clause
-- For student notifications, insert into notification_queue
-- All timestamps use TIMESTAMPTZ and NOW()
-
-Respond with a JSON array of SQL strings:
-["SQL1", "SQL2", "SQL3"]`;
-
-  const response = await callBrain(prompt, 0.2, 800);
-
+  const response = await callBrain(prompt, 0.2, 600);
   try {
-    const cleaned = response.replace(/```json|```/g, '').trim();
-    return JSON.parse(cleaned) as string[];
+    return JSON.parse(response.replace(/```json|```/g, '').trim()) as string[];
   } catch {
-    // Extract SQL manually if JSON parsing fails
-    const sqlMatches = response.match(/SELECT|INSERT|UPDATE|DELETE[^;]+;/gi) || [];
-    return sqlMatches;
+    const matches = response.match(/(SELECT|UPDATE)[^;]+/gi);
+    return matches || [];
   }
 }
 
-// Agent 3: SQL Refiner
-// Validates and refines SQL before execution
-async function refineSql(sqls: string[], task: string, relevantSchema: string): Promise<string[]> {
-  if (sqls.length === 0) return [];
+/** Static safety validation — runs on every generated statement, no exceptions. */
+function validateStatement(sql: string): { safe: boolean; reason: string } {
+  const normalized = sql.trim().replace(/\s+/g, ' ');
+  const upper = normalized.toUpperCase();
 
-  const prompt = `You are a PostgreSQL safety validator.
-
-Schema:
-${relevantSchema}
-
-Task: ${task}
-
-Generated SQL:
-${sqls.map((s, i) => `${i + 1}. ${s}`).join('\n')}
-
-Check each SQL for:
-1. Syntax errors
-2. Using columns that do not exist in schema
-3. Missing WHERE clauses on UPDATE/DELETE
-4. JSONB path correctness
-5. Queries that would affect 0 rows (wrong conditions)
-
-Return the corrected SQL array. If a query is fine, keep it as is. If wrong, fix it.
-Respond with JSON array of corrected SQL strings only:
-["corrected_SQL1", "corrected_SQL2"]`;
-
-  const response = await callBrain(prompt, 0.1, 800);
-
-  try {
-    const cleaned = response.replace(/```json|```/g, '').trim();
-    return JSON.parse(cleaned) as string[];
-  } catch {
-    return sqls; // Return original if refinement fails
+  if (normalized.includes(';') && normalized.indexOf(';') !== normalized.length - 1) {
+    return { safe: false, reason: 'Stacked statements are not allowed' };
   }
+
+  const forbidden = /\b(DELETE|INSERT|DROP|ALTER|TRUNCATE|CREATE|GRANT|REVOKE|COPY|EXECUTE|CALL|VACUUM|pg_sleep)\b/i;
+  if (forbidden.test(upper)) return { safe: false, reason: 'Statement type not allowed (SELECT/UPDATE only)' };
+
+  if (!/^(SELECT|UPDATE)\b/i.test(upper)) return { safe: false, reason: 'Statement must begin with SELECT or UPDATE' };
+
+  if (/^UPDATE\b/i.test(upper) && !/\bWHERE\b/i.test(upper)) {
+    return { safe: false, reason: 'UPDATE without WHERE is not allowed' };
+  }
+
+  const tablesMentioned = ALLOWED_TABLES.filter(t => new RegExp(`\\b${t}\\b`, 'i').test(normalized));
+  if (tablesMentioned.length === 0) return { safe: false, reason: 'Statement references no known table' };
+
+  const unknownTableMatch = normalized.match(/\b(?:FROM|UPDATE|JOIN)\s+([a-z_][a-z0-9_]*)/gi);
+  if (unknownTableMatch) {
+    for (const mention of unknownTableMatch) {
+      const table = mention.replace(/\b(?:FROM|UPDATE|JOIN)\s+/i, '').toLowerCase();
+      if (!ALLOWED_TABLES.includes(table)) {
+        return { safe: false, reason: `Table "${table}" is not in the allowed set` };
+      }
+    }
+  }
+
+  return { safe: true, reason: '' };
 }
 
-// Execute SQL with safety checks
-async function executeSqlSafely(sql: string): Promise<{ success: boolean; rowsAffected: number; error?: string }> {
-  const dangerous = /DROP TABLE|TRUNCATE|DELETE FROM \w+ WHERE 1=1/i;
-  if (dangerous.test(sql)) {
-    logger.error('[SQLAgent] Dangerous SQL blocked:', sql);
-    return { success: false, rowsAffected: 0, error: 'Dangerous operation blocked by safety filter' };
-  }
+export async function executeAutonomousTask(task: string): Promise<{ success: boolean; rowsAffected: number; errors: string[] }> {
+  logger.info(`[SQLAgent] Task: ${task.slice(0, 100)}`);
 
-  try {
-    const result = await db.query(sql);
-    return { success: true, rowsAffected: result.rowCount || 0 };
-  } catch (err) {
-    logger.error('[SQLAgent] SQL execution failed:', { sql, err });
-    return { success: false, rowsAffected: 0, error: (err as Error).message };
-  }
-}
+  const generated = await generateSQL(task);
+  if (generated.length === 0) return { success: false, rowsAffected: 0, errors: ['No SQL generated'] };
 
-// Main entry point: Text-to-SQL pipeline
-export async function executeAutonomousTask(task: string): Promise<{
-  success: boolean;
-  sqlsGenerated: string[];
-  sqlsExecuted: number;
-  rowsAffected: number;
-  errors: string[];
-}> {
-  logger.info('[SQLAgent] Task:', task);
-
-  const relevantSchema = await selectRelevantSchema(task);
-  const decomposed = await decomposeToSQL(task, relevantSchema);
-
-  if (decomposed.length === 0) {
-    return { success: false, sqlsGenerated: [], sqlsExecuted: 0, rowsAffected: 0, errors: ['No SQL generated'] };
-  }
-
-  const refined = await refineSql(decomposed, task, relevantSchema);
   const errors: string[] = [];
-  let totalRowsAffected = 0;
-  let executed = 0;
+  let totalRows = 0;
 
-  for (const sql of refined) {
-    const result = await executeSqlSafely(sql);
-    if (result.success) {
-      totalRowsAffected += result.rowsAffected;
-      executed++;
-    } else {
-      errors.push(result.error || 'Unknown error');
-      logger.warn('[SQLAgent] SQL failed:', { sql, error: result.error });
+  for (const sql of generated.slice(0, 3)) {
+    const validation = validateStatement(sql);
+    if (!validation.safe) {
+      errors.push(validation.reason);
+      logger.warn(`[SQLAgent] Blocked: ${validation.reason} — ${sql.slice(0, 80)}`);
+      continue;
+    }
+
+    try {
+      const result = await db.query(sql);
+      totalRows += result.rowCount || 0;
+    } catch (err) {
+      const msg = (err as Error).message;
+      errors.push(msg);
+      logger.warn(`[SQLAgent] SQL failed: ${sql.slice(0, 100)} — ${msg}`);
     }
   }
 
-  return {
-    success: errors.length === 0,
-    sqlsGenerated: refined,
-    sqlsExecuted: executed,
-    rowsAffected: totalRowsAffected,
-    errors,
-  };
+  return { success: errors.length === 0, rowsAffected: totalRows, errors };
 }

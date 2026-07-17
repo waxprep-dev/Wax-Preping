@@ -6,18 +6,19 @@ const breaker = new CircuitBreaker('openrouter', 3, 20_000);
 
 export async function callOpenRouter(
   messages: LLMMessage[],
-  model = 'meta-llama/llama-3.1-8b-instruct:free',
-  maxTokens = 1024
+  model: string,
+  maxTokens = 1024,
+  temperature = 0.7
 ): Promise<LLMResponse> {
   return breaker.call(async () => {
     const start = Date.now();
-
     const response = await axios.post(
       'https://openrouter.ai/api/v1/chat/completions',
       {
         model,
         messages: messages.map(m => ({ role: m.role, content: m.content })),
         max_tokens: maxTokens,
+        temperature,
       },
       {
         headers: {
@@ -30,15 +31,18 @@ export async function callOpenRouter(
       }
     );
 
-    const latencyMs = Date.now() - start;
-    const content = response.data.choices?.[0]?.message?.content ?? '';
-    const tokensIn = response.data.usage?.prompt_tokens ?? 0;
-    const tokensOut = response.data.usage?.completion_tokens ?? 0;
-
-    return { content, modelUsed: model, tokensIn, tokensOut, costUsd: 0, latencyMs };
+    return {
+      content: response.data.choices?.[0]?.message?.content ?? '',
+      modelUsed: model,
+      provider: 'openrouter',
+      tokensIn: response.data.usage?.prompt_tokens ?? 0,
+      tokensOut: response.data.usage?.completion_tokens ?? 0,
+      costUsd: 0,
+      latencyMs: Date.now() - start,
+    };
   });
 }
 
 export function isOpenRouterAvailable(): boolean {
-  return breaker.isAvailable();
+  return !!process.env.OPENROUTER_API_KEY && breaker.isAvailable();
 }

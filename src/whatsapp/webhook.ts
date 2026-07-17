@@ -1,10 +1,16 @@
+/**
+ * WhatsApp Cloud API webhook.
+ *
+ * v1 logic preserved (signature verification against the raw body, immediate
+ * 200 + async processing, dedupe, rate limiting). v2: isFirstMessage is now
+ * computed inside the crew from the profile (single source of truth), so the
+ * webhook no longer does its own profile query.
+ */
 import express, { Request, Response, Router } from 'express';
 import crypto from 'crypto';
-import { v4 as uuidv4 } from 'uuid';
 import { processTutorMessage } from '../agents/crew';
-import { sendTextMessage, sendVoiceMessage, markAsRead } from './sender';
+import { sendTextMessage, markAsRead } from './sender';
 import { isMessageProcessed, markMessageProcessed, updateLastSeen } from '../session/manager';
-import { generateVoiceResponse } from '../encoders/voice';
 import { logger } from '../middleware/logger';
 import { checkRateLimit } from '../middleware/rate_limiter';
 
@@ -20,55 +26,59 @@ export function createWebhookRouter(): Router {
       logger.info('[Webhook] Verified');
       res.status(200).send(challenge);
     } else {
-      logger.error('[Webhook] Verification failed');
       res.sendStatus(403);
     }
   });
 
   router.post('/webhook', async (req: Request, res: Response) => {
-    // Return 200 immediately — ALWAYS
     res.sendStatus(200);
 
-    // Verify signature
-    const signature = req.headers['x-hub-signature-256'] as string;
-    if (signature) {
-      const expected = `sha256=${crypto.createHmac('sha256', process.env.WHATSAPP_APP_SECRET ?? '').update(JSON.stringify(req.body)).digest('hex')}`;
-      if (!crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(signature))) {
+    // Meta signs the RAW request body — captured by the express.json verify
+    // callback in index.ts. Never re-serialize req.body for verification.
+    if (process.env.WHATSAPP_APP_SECRET) {
+      const signature = req.headers['x-hub-signature-256'] as string;
+      if (!signature) {
+        logger.warn('[Webhook] Missing X-Hub-Signature-256 header');
+        return;
+      }
+      const rawBody = (req as Request & { rawBody?: Buffer }).rawBody ?? Buffer.from(JSON.stringify(req.body));
+      const expected = `sha256=${crypto.createHmac('sha256', process.env.WHATSAPP_APP_SECRET).update(rawBody).digest('hex')}`;
+      const expectedBuf = Buffer.from(expected);
+      const signatureBuf = Buffer.from(signature);
+      if (expectedBuf.length !== signatureBuf.length || !crypto.timingSafeEqual(expectedBuf, signatureBuf)) {
         logger.warn('[Webhook] Invalid signature');
         return;
       }
     }
 
     setImmediate(() => {
-      processWebhookAsync(req.body).catch(err => logger.error('[Webhook] Async error:', err));
+      processPayload(req.body).catch(err => logger.error({ err }, '[Webhook] Async error'));
     });
   });
 
   return router;
 }
 
-async function processWebhookAsync(body: Record<string, unknown>): Promise<void> {
+async function processPayload(body: Record<string, unknown>): Promise<void> {
   const entries = (body.entry as Record<string, unknown>[]) ?? [];
 
   for (const entry of entries) {
     const changes = (entry.changes as Record<string, unknown>[]) ?? [];
-
     for (const change of changes) {
       const value = change.value as Record<string, unknown>;
       const messages = (value.messages as Record<string, unknown>[]) ?? [];
-      const metadata = value.metadata as Record<string, unknown>;
-      const phoneNumberId = metadata?.phone_number_id as string;
+      const phoneNumberId = (value.metadata as Record<string, unknown>)?.phone_number_id as string;
 
       for (const message of messages) {
-        await processMessage(message, phoneNumberId).catch(err =>
-          logger.error('[Webhook] Message processing error:', err)
+        await handleMessage(message, phoneNumberId).catch(err =>
+          logger.error({ err }, '[Webhook] Message error')
         );
       }
     }
   }
 }
 
-async function processMessage(message: Record<string, unknown>, phoneNumberId: string): Promise<void> {
+async function handleMessage(message: Record<string, unknown>, phoneNumberId: string): Promise<void> {
   const messageId = message.id as string;
   const studentId = message.from as string;
   const messageType = message.type as string;
@@ -79,38 +89,29 @@ async function processMessage(message: Record<string, unknown>, phoneNumberId: s
 
   if (phoneNumberId) await markAsRead(phoneNumberId, messageId);
 
-  // Rate limiting: max 30 messages per student per hour
-  const rateCheck = await checkRateLimit(`student:${studentId}:messages`, 30, 3600);
+  const rateCheck = await checkRateLimit(`student:${studentId}`, 30, 3600);
   if (!rateCheck.allowed) {
-    logger.warn(`[Webhook] Rate limit hit for student ${studentId}`);
-    if (phoneNumberId) {
-      await sendTextMessage(phoneNumberId, studentId, 'Slow down a bit! You can send more messages in an hour. Take a moment to review what we discussed.');
-    }
+    if (phoneNumberId) await sendTextMessage(phoneNumberId, studentId, 'Slow down small! Take a moment to review what we discussed. You can send more in an hour.');
     return;
   }
 
-  const sessionId = `${studentId}_session`;
+  const unsupported: Record<string, string> = {
+    video: "I can see you sent a video — I can't watch it yet. Can you describe it or type your question?",
+    sticker: 'Nice sticker! What are you studying today?',
+    contacts: 'I see you shared a contact. What topic are you working on?',
+    location: 'I see your location. What topic are you studying?',
+  };
 
-  // Check if this is likely their first ever message
-  const { db } = await import('../db/client');
-  const profileCheck = await db.query(`SELECT total_turns FROM student_profiles WHERE student_id = $1`, [studentId]);
-  const isFirstMessage = !profileCheck.rows.length || profileCheck.rows[0].total_turns === 0;
+  if (unsupported[messageType]) {
+    if (phoneNumberId) await sendTextMessage(phoneNumberId, studentId, unsupported[messageType]);
+    return;
+  }
 
-  // Handle unsupported types gracefully
   if (!['text', 'image', 'audio', 'document'].includes(messageType)) {
-    if (phoneNumberId) {
-      const typeReplies: Record<string, string> = {
-        video: "I can see you sent a video — I can't watch it yet, but I'm learning! Can you describe what's in it, or type your question?",
-        sticker: "Nice sticker 😄 What's on your mind?",
-        contacts: "I see you shared a contact. What are you studying today?",
-        location: "I see you shared your location. What are you working on?",
-      };
-      await sendTextMessage(phoneNumberId, studentId, typeReplies[messageType] || "I got your message but can't process this format yet. Try sending text, a photo, or a voice note!");
-    }
+    if (phoneNumberId) await sendTextMessage(phoneNumberId, studentId, "I got your message but can't process this format. Try text, a photo, or a voice note!");
     return;
   }
 
-  // Extract media info based on type
   let rawMessage = '';
   let mediaId: string | undefined;
   let mediaCaption: string | undefined;
@@ -137,33 +138,16 @@ async function processMessage(message: Record<string, unknown>, phoneNumberId: s
 
   try {
     const responseText = await processTutorMessage({
-      studentId,
-      sessionId,
-      rawMessage,
-      messageId,
+      studentId, rawMessage, messageId,
       modality: messageType as 'text' | 'image' | 'audio' | 'document' | 'video',
-      mediaId,
-      mediaCaption,
-      isFirstMessage,
+      mediaId, mediaCaption,
     });
 
-    if (!phoneNumberId || !responseText) return;
-
-    // For audio input with TTS enabled, optionally respond with voice
-    const preferVoice = messageType === 'audio' && process.env.ELEVENLABS_API_KEY;
-    if (preferVoice) {
-      const audioBuffer = await generateVoiceResponse(responseText);
-      if (audioBuffer) {
-        await sendVoiceMessage(phoneNumberId, studentId, audioBuffer);
-        // Also send text for accessibility
-        await sendTextMessage(phoneNumberId, studentId, `_(Text version)_\n${responseText}`);
-        return;
-      }
+    if (phoneNumberId && responseText) {
+      await sendTextMessage(phoneNumberId, studentId, responseText);
     }
-
-    await sendTextMessage(phoneNumberId, studentId, responseText);
   } catch (err) {
-    logger.error('[Webhook] Process message error:', err);
+    logger.error({ err }, '[Webhook] Processing failed');
     if (phoneNumberId) {
       await sendTextMessage(phoneNumberId, studentId, "Something went wrong on my end. Give me a moment and try again — I'm still here.");
     }

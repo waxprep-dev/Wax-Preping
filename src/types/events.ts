@@ -1,3 +1,12 @@
+/**
+ * Domain events flowing through the EventBus (Redis Streams with in-memory fallback).
+ *
+ * v2.0 changes:
+ * - Every declared event is now actually published somewhere in the system
+ *   (v1 declared EmotionalAlert, PromptEvolved, ReflectionStored and several
+ *   EventType members that nothing ever emitted).
+ * - Removed the dead ForceVector interface (nothing referenced it).
+ */
 export type EventType =
   | 'student.message.received'
   | 'tutor.response.generated'
@@ -20,6 +29,12 @@ export interface BaseEvent {
   timestamp: Date;
 }
 
+export interface StudentMessageReceived extends BaseEvent {
+  type: 'student.message.received';
+  modality: string;
+  isFirstMessage: boolean;
+}
+
 export interface TutorResponseGenerated extends BaseEvent {
   type: 'tutor.response.generated';
   responseText: string;
@@ -31,8 +46,15 @@ export interface TutorResponseGenerated extends BaseEvent {
   toolsUsed: string[];
   defensePassed: boolean;
   defenseIssues: string[];
-  chainLog?: Record<string, unknown>[];
+  strategy?: string;
   reflectionScore?: number;
+}
+
+export interface MemoryUpdated extends BaseEvent {
+  type: 'memory.updated';
+  block: string;
+  operation: 'append' | 'replace' | 'delete';
+  summary: string;
 }
 
 export interface EmotionalAlert extends BaseEvent {
@@ -48,6 +70,18 @@ export interface MasteryDetected extends BaseEvent {
   concept: string;
   evidenceType: string;
   masteryLevel: number;
+}
+
+export interface SessionStarted extends BaseEvent {
+  type: 'session.started';
+  isReturningStudent: boolean;
+  daysSinceLastSession: number | null;
+}
+
+export interface SessionEnded extends BaseEvent {
+  type: 'session.ended';
+  turnCount: number;
+  conceptsCovered: string[];
 }
 
 export interface PromptEvolved extends BaseEvent {
@@ -72,10 +106,26 @@ export interface ReflectionStored extends BaseEvent {
   improvement: string;
 }
 
+export interface SpacedReviewDue extends BaseEvent {
+  type: 'spaced.review.due';
+  concepts: string[];
+}
+
+export interface StudyStreakUpdated extends BaseEvent {
+  type: 'study.streak.updated';
+  streak: number;
+}
+
 export type AnyEvent =
+  | StudentMessageReceived
   | TutorResponseGenerated
+  | MemoryUpdated
   | EmotionalAlert
   | MasteryDetected
+  | SessionStarted
+  | SessionEnded
   | PromptEvolved
   | DefenseTriggered
-  | ReflectionStored;
+  | ReflectionStored
+  | SpacedReviewDue
+  | StudyStreakUpdated;

@@ -4,10 +4,7 @@ import { logger } from '../middleware/logger';
 const WA_BASE = 'https://graph.facebook.com/v20.0';
 
 function headers() {
-  return {
-    Authorization: `Bearer ${process.env.WHATSAPP_ACCESS_TOKEN}`,
-    'Content-Type': 'application/json',
-  };
+  return { Authorization: `Bearer ${process.env.WHATSAPP_ACCESS_TOKEN}`, 'Content-Type': 'application/json' };
 }
 
 export async function sendTextMessage(phoneNumberId: string, to: string, text: string): Promise<string> {
@@ -15,45 +12,20 @@ export async function sendTextMessage(phoneNumberId: string, to: string, text: s
   let lastId = '';
 
   for (let i = 0; i < chunks.length; i++) {
-    const response = await axios.post(
-      `${WA_BASE}/${phoneNumberId}/messages`,
-      { messaging_product: 'whatsapp', recipient_type: 'individual', to, type: 'text', text: { body: chunks[i], preview_url: false } },
-      { headers: headers() }
-    );
-    lastId = response.data?.messages?.[0]?.id ?? '';
-
-    if (chunks.length > 1 && i < chunks.length - 1) {
-      await new Promise(r => setTimeout(r, 1200));
+    try {
+      const response = await axios.post(
+        `${WA_BASE}/${phoneNumberId}/messages`,
+        { messaging_product: 'whatsapp', recipient_type: 'individual', to, type: 'text', text: { body: chunks[i], preview_url: false } },
+        { headers: headers(), timeout: 15_000 }
+      );
+      lastId = response.data?.messages?.[0]?.id ?? '';
+      if (i < chunks.length - 1) await new Promise(r => setTimeout(r, 1200));
+    } catch (err) {
+      logger.error('[Sender] Send failed:');
     }
   }
 
   return lastId;
-}
-
-export async function sendVoiceMessage(phoneNumberId: string, to: string, audioBuffer: Buffer): Promise<void> {
-  try {
-    // Upload media first
-    const FormData = (await import('form-data')).default;
-    const form = new FormData();
-    form.append('file', audioBuffer, { filename: 'response.mp3', contentType: 'audio/mpeg' });
-    form.append('messaging_product', 'whatsapp');
-
-    const uploadResponse = await axios.post(
-      `${WA_BASE}/${phoneNumberId}/media`,
-      form,
-      { headers: { ...form.getHeaders(), Authorization: `Bearer ${process.env.WHATSAPP_ACCESS_TOKEN}` } }
-    );
-
-    const mediaId = uploadResponse.data.id;
-
-    await axios.post(
-      `${WA_BASE}/${phoneNumberId}/messages`,
-      { messaging_product: 'whatsapp', to, type: 'audio', audio: { id: mediaId } },
-      { headers: headers() }
-    );
-  } catch (err) {
-    logger.warn('[Sender] Voice message send failed:', err);
-  }
 }
 
 export async function markAsRead(phoneNumberId: string, messageId: string): Promise<void> {
@@ -61,7 +33,7 @@ export async function markAsRead(phoneNumberId: string, messageId: string): Prom
     await axios.post(
       `${WA_BASE}/${phoneNumberId}/messages`,
       { messaging_product: 'whatsapp', status: 'read', message_id: messageId },
-      { headers: headers() }
+      { headers: headers(), timeout: 5_000 }
     );
   } catch { /* not critical */ }
 }
