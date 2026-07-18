@@ -17,6 +17,15 @@ import { getActiveAttributes, getPromptGradeAttributes } from './student_profile
 import { matchArchetypes, warmStartFromArchetype } from './student_profile/archetypes';
 import { getOnboardingState } from './onboarding/engine';
 import { executeToolByName } from './tools/implementations';
+import { getGraphAdapter } from './graph/factory';
+import { migrateExistingDataToGraph } from './graph/migration';
+import { getCognitiveConfig, setCognitiveConfig, getSegmentationConfig, updateSegmentationWeights, getForgettingParams, updateForgettingParams } from './config/cognitive';
+import { evaluateSessionBoundary, getRecentBoundaries, provideBoundaryFeedback } from './cognitive/segmentation';
+import { retrieveMemories } from './forgetting/engine';
+import { predictivePreLoad, checkPreloadCache } from './predictive/engine';
+import { ensurePalace, getPalaceHierarchy, getPalaceStats, discoverTunnels } from './palace/organizer';
+import { runSleepMode } from './sleep/pipeline';
+import { startSleepScheduler } from './sleep/scheduler';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -237,6 +246,190 @@ app.get('/admin/observability/decisions', async (req: Request, res: Response) =>
   }
 });
 
+// ── v3.0 Admin Routes: Cognitive Memory Architecture ─────────────────────
+
+// Graph migration
+app.post('/admin/cognitive/migrate-graph', async (_req: Request, res: Response) => {
+  try {
+    const result = await migrateExistingDataToGraph();
+    res.json({ status: 'migration_complete', ...result });
+  } catch (err) {
+    res.status(500).json({ error: 'Graph migration failed' });
+  }
+});
+
+// Graph health
+app.get('/admin/cognitive/graph-health', async (_req: Request, res: Response) => {
+  try {
+    const graph = await getGraphAdapter();
+    const healthy = await graph.healthCheck();
+    res.json({ adapter: graph.name, healthy });
+  } catch (err) {
+    res.status(500).json({ error: 'Graph health check failed' });
+  }
+});
+
+// Segmentation config
+app.get('/admin/cognitive/segmentation-config/:studentId?', async (req: Request, res: Response) => {
+  try {
+    const config = await getSegmentationConfig(req.params.studentId);
+    res.json(config);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch segmentation config' });
+  }
+});
+
+app.post('/admin/cognitive/segmentation-config/:studentId?', async (req: Request, res: Response) => {
+  try {
+    const { weights } = req.body;
+    if (weights) {
+      await updateSegmentationWeights(req.params.studentId || null, weights);
+    }
+    res.json({ status: 'updated' });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to update segmentation config' });
+  }
+});
+
+// Boundary evaluation (test endpoint)
+app.post('/admin/cognitive/evaluate-boundary', async (req: Request, res: Response) => {
+  try {
+    const { studentId, currentMessage, previousMessage, currentTopic, emotionalSnapshot, timeGapMinutes, recentContext } = req.body;
+    const decision = await evaluateSessionBoundary(
+      studentId,
+      currentMessage,
+      previousMessage,
+      currentTopic,
+      emotionalSnapshot || {},
+      recentContext || '',
+      timeGapMinutes || 0
+    );
+    res.json(decision);
+  } catch (err) {
+    res.status(500).json({ error: 'Boundary evaluation failed' });
+  }
+});
+
+// Recent boundaries
+app.get('/admin/cognitive/boundaries/:studentId', async (req: Request, res: Response) => {
+  try {
+    const boundaries = await getRecentBoundaries(req.params.studentId, parseInt(req.query.limit as string || '10', 10));
+    res.json({ studentId: req.params.studentId, boundaries });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch boundaries' });
+  }
+});
+
+// Boundary feedback
+app.post('/admin/cognitive/boundary-feedback/:boundaryId', async (req: Request, res: Response) => {
+  try {
+    const { wasCorrect } = req.body;
+    await provideBoundaryFeedback(req.params.boundaryId, wasCorrect === true);
+    res.json({ boundaryId: req.params.boundaryId, feedback: wasCorrect });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to record feedback' });
+  }
+});
+
+// Forgetting params
+app.get('/admin/cognitive/forgetting-params/:studentId', async (req: Request, res: Response) => {
+  try {
+    const params = await getForgettingParams(req.params.studentId);
+    res.json(params);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch forgetting params' });
+  }
+});
+
+app.post('/admin/cognitive/forgetting-params/:studentId', async (req: Request, res: Response) => {
+  try {
+    await updateForgettingParams(req.params.studentId, req.body);
+    res.json({ status: 'updated' });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to update forgetting params' });
+  }
+});
+
+// Memory retrieval (test endpoint)
+app.post('/admin/cognitive/retrieve-memories', async (req: Request, res: Response) => {
+  try {
+    const { studentId, query, workingMemoryContext, limit } = req.body;
+    const memories = await retrieveMemories(query, studentId, workingMemoryContext || '', { limit });
+    res.json({ studentId, query, memories });
+  } catch (err) {
+    res.status(500).json({ error: 'Memory retrieval failed' });
+  }
+});
+
+// Predictive pre-load
+app.post('/admin/cognitive/preload/:studentId', async (req: Request, res: Response) => {
+  try {
+    const context = await predictivePreLoad(req.params.studentId);
+    res.json({ studentId: req.params.studentId, context });
+  } catch (err) {
+    res.status(500).json({ error: 'Pre-load failed' });
+  }
+});
+
+app.get('/admin/cognitive/preload/:studentId', async (req: Request, res: Response) => {
+  try {
+    const context = await checkPreloadCache(req.params.studentId);
+    res.json({ studentId: req.params.studentId, context });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to check preload' });
+  }
+});
+
+// Memory Palace
+app.get('/admin/cognitive/palace/:studentId', async (req: Request, res: Response) => {
+  try {
+    const palace = await ensurePalace(req.params.studentId);
+    const hierarchy = await getPalaceHierarchy(req.params.studentId);
+    const stats = await getPalaceStats(req.params.studentId);
+    res.json({ palace, hierarchy, stats });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch palace' });
+  }
+});
+
+app.post('/admin/cognitive/palace/:studentId/discover-tunnels', async (req: Request, res: Response) => {
+  try {
+    const tunnels = await discoverTunnels(req.params.studentId);
+    res.json({ studentId: req.params.studentId, tunnels });
+  } catch (err) {
+    res.status(500).json({ error: 'Tunnel discovery failed' });
+  }
+});
+
+// Sleep mode
+app.post('/admin/cognitive/sleep-mode/:studentId', async (req: Request, res: Response) => {
+  try {
+    const result = await runSleepMode(req.params.studentId);
+    res.json({ studentId: req.params.studentId, result });
+  } catch (err) {
+    res.status(500).json({ error: 'Sleep mode failed' });
+  }
+});
+
+// Cognitive system config
+app.get('/admin/cognitive/config/:key', async (req: Request, res: Response) => {
+  try {
+    const config = await getCognitiveConfig(req.params.key as any);
+    res.json({ key: req.params.key, config });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch config' });
+  }
+});
+
+app.post('/admin/cognitive/config/:key', async (req: Request, res: Response) => {
+  try {
+    await setCognitiveConfig(req.params.key as any, req.body);
+    res.json({ status: 'updated', key: req.params.key });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to update config' });
+  }
+});
+
 // ── WhatsApp Webhook ───────────────────────────────────────────────────
 
 app.use('/whatsapp', createWebhookRouter());
@@ -245,6 +438,10 @@ app.use('/whatsapp', createWebhookRouter());
 
 async function main() {
   await initializeDatabase();
+  
+  // Start sleep mode scheduler in background
+  startSleepScheduler().catch(err => logger.error({ err }, '[Startup] Sleep scheduler failed'));
+  
   app.listen(PORT, () => {
     logger.info(`[Server] WaxPrep v3.0 listening on port ${PORT}`);
   });
