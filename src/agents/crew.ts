@@ -1,24 +1,15 @@
 /**
- * The Crew — WaxPrep's unified turn pipeline (v2.0).
+ * The Crew — WaxPrep's unified turn pipeline (v3.0).
  *
- * v1 ran: encoder -> swarm router -> world model -> causal -> tools ->
- * subject context -> [chain(4 calls) | emotional+cultural+pedagogy(3 calls)]
- * -> defense -> curriculum. That is 6-9 sequential LLM calls per message,
- * each seeing a different slice of the truth, with the vision analysis and
- * most emotional signals silently dropped along the way.
+ * Integrates:
+ * - Dynamic student profile (attributes, archetypes)
+ * - Onboarding engine (natural, goal-driven discovery)
+ * - Syllabus vector store (no forced sequences)
+ * - AI-driven navigation (the tutor decides what to teach)
+ * - Tool registry (dynamic, extensible)
  *
- * v2 runs ONE coherent cognitive cycle:
- *
- *   perceive (1 fast call)
- *     -> assemble context (memory, episodes, world model, tools)
- *     -> deliberate (1 smart call -> TeachingPlan)
- *     -> generate (1 smart call)
- *     -> defend (0-1 fix calls)
- *     -> persist + update session state
- *     -> async: reflect, update student model, assess curriculum
- *
- * 3 calls on the critical path instead of 6-9: faster replies on WhatsApp,
- * lower cost, and every decision made with full information.
+ * 3 calls on the critical path: perceive → deliberate → generate.
+ * Async: attribute extraction, archetype matching, navigation logging.
  */
 import { v4 as uuidv4 } from 'uuid';
 import { eventBus } from '../events/bus';
@@ -32,8 +23,6 @@ import {
 } from '../teaching/policy';
 import { assessCurriculum } from '../teaching/curriculum';
 import { getSubjectPedagogy, formatSubjectContext } from '../teaching/strategies';
-import { nextLessonNode, formatLessonPacket } from '../teaching/lesson_graph';
-import { bootstrapCurriculum, recommendConcept } from '../curriculum/engine';
 import { recordTurnMetric } from '../observability/metrics';
 import { runDefenseChecks } from '../defense/defense';
 import { runReflection, getReflectionSummary } from '../reflection/reflection';
@@ -41,17 +30,22 @@ import { buildWorkingMemory, formatHistoryForOrchestrator } from '../memory/work
 import { getStudentProfile, updateStudyStreak, incrementTurns, updateSymbolicBelief, applyMemoryEdit } from '../memory/semantic';
 import { saveEpisode, getRecentHistory, recallRelevantEpisodes } from '../memory/episodic';
 import { updateStudentModel } from '../memory/student_model';
-import { applyInstantFacts } from '../memory/instant_facts';
 import { buildStudentDossier } from '../memory/dossier';
 import { getOrCreateSession, touchSession, updateSessionState } from '../session/manager';
 import { scheduleConceptReview, getDueReviews } from '../features/spaced_repetition';
-import { suggestNextConcept } from '../neuro_symbolic/knowledge_graph';
-import { analyzeCausally } from '../neuro_symbolic/causal_reasoner';
 import { getWorldModelState } from '../world_model/predictive_model';
-import { executeTool } from '../tools/registry';
+import { executeToolByName } from '../tools/implementations';
 import { recordPromptPerformance } from '../reflection/evolution';
 import { db } from '../db/client';
 import { logger } from '../middleware/logger';
+
+// v3.0 imports
+import { handleOnboardingTurn, isInOnboarding } from '../onboarding/engine';
+import { extractAttributesFromTurn, getActiveAttributes, buildAttributeContext } from '../student_profile/attribute_pipeline';
+import { getArchetypePromptModifier, matchArchetypes } from '../student_profile/archetypes';
+import { decideNextTopic, getRecentErrors } from '../navigation/ai_navigator';
+import { searchSyllabus, formatSyllabusContext } from '../syllabus/store';
+
 import type { ConversationTurn, ExamTarget } from '../types/student';
 import type { TurnContext, TurnResult } from '../types/teaching';
 import type { StudentMessageReceived, TutorResponseGenerated, MasteryDetected, EmotionalAlert, SessionStarted } from '../types/events';
@@ -69,6 +63,39 @@ export interface ProcessMessageInput {
 export async function processTutorMessage(input: ProcessMessageInput): Promise<string> {
   const { studentId, rawMessage, modality, mediaId, mediaCaption } = input;
   const start = Date.now();
+
+  // ── 0. ONBOARDING CHECK ─────────────────────────────────────────────────
+  const inOnboarding = await isInOnboarding(studentId);
+  if (inOnboarding || input.isFirstMessage) {
+    const onboardingResult = await handleOnboardingTurn(
+      studentId,
+      rawMessage,
+      {
+        rawMessage,
+        modality,
+        primaryIntent: 'greeting',
+        emotionalSignals: {
+          valence: 0.6, arousal: 0.4, dominance: 0.5,
+          shamePotential: 0.2, curiosity: 0.5, selfEfficacy: 0.5,
+          flowIndicator: 0.3, frustration: 0.2, tiredness: 0.1, excitement: 0.3,
+          dominantEmotion: 'neutral',
+        },
+        urgency: 'normal',
+        cognitiveLoad: 'medium',
+        masterySignal: 'none',
+        languageStyle: 'mixed',
+        temporalPressure: 'none',
+        isRepeatedQuestion: false,
+        repetitionCount: 0,
+      } as import('../types/teaching').PerceptionResult,
+      input.isFirstMessage || false
+    );
+
+    if (!onboardingResult.isComplete) {
+      return onboardingResult.response;
+    }
+    // Onboarding complete — fall through to normal tutoring
+  }
 
   // ── 1. Identity: session + profile + history ────────────────────────────
   const session = await getOrCreateSession(studentId);
@@ -116,30 +143,36 @@ export async function processTutorMessage(input: ProcessMessageInput): Promise<s
     eventBus.publish(alert).catch(() => {});
   }
 
+  // ── 3. Dynamic Attribute Context (v3.0) ─────────────────────────────────
+  const activeAttributes = await getActiveAttributes(studentId).catch(() => ({}));
+  const attributeContext = await buildAttributeContext(studentId).catch(() => 'No learner model yet.');
+  const archetypeModifier = await getArchetypePromptModifier(studentId).catch(() => '');
 
-  // Instant durable facts (no LLM) so next deliberation already knows goals/course
-  await applyInstantFacts(studentId, perception.rawMessage).catch(() => {});
-  // Refresh profile if we may have written facts (cheap re-read)
-  if (Object.keys(profile.facts || {}).length < 3) {
-    try {
-      const refreshed = await getStudentProfile(studentId);
-      Object.assign(profile, refreshed);
-    } catch { /* keep existing profile */ }
-  }
-
-  // ── 3. Context assembly (all in parallel) ───────────────────────────────
+  // ── 4. Context assembly (all in parallel) ───────────────────────────────
   const workingMemory = buildWorkingMemory(history, session.state);
   const historyText = formatHistoryForOrchestrator(history, 12);
   const currentConcept = perception.inferredTopic || session.state.currentConcept;
   const currentSubject = perception.inferredSubject || session.state.currentSubject || 'general';
 
-  const [recalled, dueReviews, reflectionSummary, worldModel, subjectPedagogy] = await Promise.all([
+  const [recalled, dueReviews, reflectionSummary, worldModel, subjectPedagogy, recentErrors] = await Promise.all([
     recallRelevantEpisodes(studentId, perception.rawMessage, 4, sessionId).catch(() => []),
     getDueReviews(studentId).catch(() => []),
     getReflectionSummary(studentId).catch(() => ''),
     getWorldModelState(studentId).catch(() => null),
     getSubjectPedagogy(currentSubject).catch(() => null),
+    getRecentErrors(studentId, 3).catch(() => []),
   ]);
+
+  // v3.0: Syllabus query for current topic
+  let syllabusContext = '';
+  if (currentConcept) {
+    const syllabusResults = await searchSyllabus({
+      query: currentConcept,
+      subject: currentSubject !== 'general' ? currentSubject : undefined,
+      limit: 3,
+    }).catch(() => []);
+    syllabusContext = formatSyllabusContext(syllabusResults);
+  }
 
   const recalledText = recalled.length > 0
     ? recalled.map(e => `[${e.timestamp.toLocaleDateString('en-NG')}] Student: "${e.studentMessage.slice(0, 90)}" | You: "${e.tutorResponse.slice(0, 90)}"`).join('\n')
@@ -153,55 +186,21 @@ export async function processTutorMessage(input: ProcessMessageInput): Promise<s
     ? `Predicted next mistake: ${worldModel.predictedNextMistake || 'none'} | frustration risk: ${(worldModel.predictedFrustrationProbability * 100).toFixed(0)}% | forgetting risk: ${worldModel.predictedForgetConcepts.join(', ') || 'none'}`
     : '';
 
-  // Root-cause analysis only when genuinely stuck — expensive, so gated.
-  let causalInsight = '';
-  if (session.state.struggleCount >= 2 && currentConcept) {
-    const causal = await analyzeCausally(studentId, currentConcept, currentSubject).catch(() => null);
-    if (causal) {
-      causalInsight = `Root cause: ${causal.rootCause} | Prerequisite gaps: ${causal.prerequisiteGaps.join(', ') || 'none'} | Intervention: ${causal.recommendedIntervention}`;
-    }
-  }
-
   const knowledgeLevel = currentConcept && profile.conceptProgress[currentConcept]
     ? profile.conceptProgress[currentConcept].masteryLevel
     : 0.5;
 
-  await bootstrapCurriculum().catch(() => {});
-  let lessonNode = nextLessonNode(
-    currentSubject,
-    profile.conceptProgress || {},
-    currentConcept || session.state.currentConcept
-  );
-  let lessonPacket = formatLessonPacket(lessonNode);
-  // Prefer DB-backed curriculum engine when packs are ingested
-  try {
-    const rec = await recommendConcept({
-      subjectQuery: currentSubject,
-      currentConceptId: currentConcept || session.state.currentConcept,
-      conceptProgress: profile.conceptProgress || {},
-    });
-    if (rec) {
-      lessonNode = {
-        id: rec.concept.conceptId,
-        subject: rec.concept.subjectId,
-        title: rec.concept.title,
-        prerequisites: [],
-        microLesson: rec.concept.microLesson || rec.concept.title,
-        bloomTarget: (rec.concept.bloomTarget as 'remember' | 'understand' | 'apply') || 'understand',
-        examTags: rec.concept.examTags as string[],
-        localHook: rec.concept.localHooks?.[0] || '',
-      };
-      lessonPacket = rec.packet;
-    }
-  } catch { /* pack-file fallback already in lessonNode */ }
   const dossier = buildStudentDossier(profile, session.state);
 
+  // v3.0: Build dynamic subject context from syllabus + attributes
   const subjectContext = [
     subjectPedagogy
       ? formatSubjectContext(subjectPedagogy, currentSubject, currentConcept, knowledgeLevel)
       : '',
-    lessonPacket,
-    `STUDENT DOSSIER (hierarchical memory — use, do not re-ask known facts):\n${dossier}`,
+    syllabusContext ? `SYLLABUS REFERENCE:\n${syllabusContext}` : '',
+    `STUDENT ATTRIBUTES (use these — do not re-ask known facts):\n${attributeContext}`,
+    archetypeModifier ? `ARCHETYPE GUIDANCE:\n${archetypeModifier}` : '',
+    `STUDENT DOSSIER (hierarchical memory):\n${dossier}`,
   ].filter(Boolean).join('\n\n');
 
   const ctx: TurnContext = {
@@ -218,35 +217,61 @@ export async function processTutorMessage(input: ProcessMessageInput): Promise<s
     dueReviews: dueReviewsText,
     reflectionLessons: reflectionSummary,
     worldModelInsight,
-    causalInsight,
+    causalInsight: '',
     toolContext: '',
     subjectContext,
   };
 
-  // ── 4. Deliberation ─────────────────────────────────────────────────────
+  // ── 5. AI-Driven Navigation (v3.0) ──────────────────────────────────────
+  let navigationDecision = null;
+  if (perception.primaryIntent === 'ready_to_learn' || perception.primaryIntent === 'asking_explanation') {
+    navigationDecision = await decideNextTopic({
+      studentId,
+      currentTopic: currentConcept,
+      currentSubject,
+      studentMessage: perception.rawMessage,
+      perceptionIntent: perception.primaryIntent,
+      bktMastery: Object.fromEntries(
+        Object.entries(profile.conceptProgress || {}).map(([k, v]) => [k, v.masteryLevel])
+      ),
+      recentErrors,
+      emotionalState: {
+        frustration: perception.emotionalSignals.frustration,
+        curiosity: perception.emotionalSignals.curiosity,
+        selfEfficacy: perception.emotionalSignals.selfEfficacy,
+      },
+    }).catch(() => null);
+
+    if (navigationDecision?.nextTopic) {
+      ctx.sessionState.currentConcept = navigationDecision.nextTopic;
+      ctx.sessionState.currentSubject = navigationDecision.nextSubject || currentSubject;
+    }
+  }
+
+  // ── 6. Deliberation ───────────────────────────────────────────────────
   const plan = await deliberate(ctx);
   logger.info(`[Crew] strategy=${plan.strategy} | intent=${perception.primaryIntent} | emotion=${perception.emotionalSignals.dominantEmotion} | ${plan.strategyReason}`);
 
-  // ── 5. Tools (only those the plan calls for) ────────────────────────────
+  // ── 7. Tools (dynamic registry, v3.0) ───────────────────────────────────
   const toolsUsed: string[] = [];
   if (plan.needsTools.length > 0) {
-    const examBoard = profile.culturalContext.examBoards?.[0] || 'WAEC';
     const toolResults: string[] = [];
 
     for (const toolName of plan.needsTools.slice(0, 2)) {
       const params: Record<string, unknown> = {
         query: currentConcept || perception.rawMessage.slice(0, 80),
         topic: currentConcept || perception.rawMessage.slice(0, 80),
-        examBoard,
+        exam_board: profile.culturalContext.examBoards?.[0] || 'WAEC',
+        subject: currentSubject !== 'general' ? currentSubject : undefined,
       };
-      const result = await executeTool(toolName, params, studentId).catch(() => '');
-      if (result && !result.startsWith('No ') && !result.startsWith('Unknown')) {
-        toolResults.push(result);
+      const result = await executeToolByName(toolName, params, studentId);
+      if (result.success && !result.output.startsWith('No ') && !result.output.startsWith('Unknown')) {
+        toolResults.push(result.output);
         toolsUsed.push(toolName);
       }
     }
 
-    // Auto-create a study plan when exam pressure is real and none exists
+    // Auto-create study plan when exam pressure is real
     if (perception.temporalPressure !== 'none' && !profile.studyPlan) {
       const nextExam = (profile.examTargets || []).find(
         (e: ExamTarget) => e.examDate && new Date(e.examDate).getTime() > Date.now()
@@ -256,11 +281,11 @@ export async function processTutorMessage(input: ProcessMessageInput): Promise<s
           .filter(([, v]) => v.masteryLevel < 0.5)
           .map(([k]) => k)
           .join(', ');
-        const planResult = await executeTool('generate_study_plan', {
+        const planResult = await executeToolByName('generate_study_plan', {
           studentId, subject: nextExam.subjects?.[0] || currentSubject, examDate: nextExam.examDate, conceptGaps: gaps,
-        }, studentId).catch(() => '');
-        if (planResult && !planResult.startsWith('Unknown')) {
-          toolResults.push(planResult);
+        }, studentId);
+        if (planResult.success && !planResult.output.startsWith('Unknown')) {
+          toolResults.push(planResult.output);
           toolsUsed.push('generate_study_plan');
         }
       }
@@ -269,10 +294,10 @@ export async function processTutorMessage(input: ProcessMessageInput): Promise<s
     ctx.toolContext = toolResults.join('\n\n');
   }
 
-  // ── 6. Generation ───────────────────────────────────────────────────────
+  // ── 8. Generation ─────────────────────────────────────────────────────
   const generation = await generate(ctx, plan);
 
-  // ── 7. Defense ──────────────────────────────────────────────────────────
+  // ── 9. Defense ──────────────────────────────────────────────────────────
   const defense = await runDefenseChecks(
     perception.rawMessage,
     generation.content,
@@ -283,7 +308,7 @@ export async function processTutorMessage(input: ProcessMessageInput): Promise<s
   const finalResponse = defense.finalResponse;
   const latencyMs = Date.now() - start;
 
-  // ── 8. Session state update (ground truth for next turn) ────────────────
+  // ── 10. Session state update ────────────────────────────────────────────
   const struggled =
     perception.primaryIntent === 'expressing_confusion' ||
     perception.emotionalSignals.frustration > 0.6 ||
@@ -303,17 +328,10 @@ export async function processTutorMessage(input: ProcessMessageInput): Promise<s
   const questionsThisSession = (session.state.questionsThisSession || 0) + (askedQuestion ? 1 : 0);
   const turnsSinceLastTeach = taught ? 0 : (session.state.turnsSinceLastTeach || 0) + 1;
 
-  // Prefer subject inferred from student goals when perception is empty
-  const goalSubject =
-    profile.facts?.intended_course?.factValue ||
-    profile.facts?.subject_interest?.factValue ||
-    null;
-  const resolvedSubject = currentSubject !== 'general'
-    ? currentSubject
-    : (session.state.currentSubject || inferSubjectFromGoal(goalSubject) || currentSubject);
-  const resolvedConcept = currentConcept || session.state.currentConcept || (
+  const resolvedSubject = navigationDecision?.nextSubject || currentSubject;
+  const resolvedConcept = navigationDecision?.nextTopic || currentConcept || (
     signals.readyToLearn || signals.foundationGap || plan.mustTeachContent
-      ? lessonNode.id
+      ? (await searchSyllabus({ query: perception.rawMessage, subject: resolvedSubject, limit: 1 }).catch(() => []))[0]?.topic || null
       : null
   );
 
@@ -335,7 +353,7 @@ export async function processTutorMessage(input: ProcessMessageInput): Promise<s
     foundationGapDisclosed: session.state.foundationGapDisclosed || signals.foundationGap,
   }).catch(() => {});
 
-  // ── 9. Persist the turn ─────────────────────────────────────────────────
+  // ── 11. Persist the turn ───────────────────────────────────────────────
   const turn: ConversationTurn = {
     turnId: uuidv4(), sessionId, studentId,
     turnNumber: session.turnCount + 1,
@@ -390,7 +408,7 @@ export async function processTutorMessage(input: ProcessMessageInput): Promise<s
     latencyMs,
   }).catch(() => {});
 
-  // ── 10. Async post-turn cognition (never blocks the reply) ─────────────
+  // ── 12. Async post-turn cognition (never blocks the reply) ───────────
   setImmediate(() => {
     runPostTurn(ctx, plan, turn, perception.masterySignal).catch(err =>
       logger.debug({ err }, '[Crew] Post-turn processing failed')
@@ -421,7 +439,21 @@ async function runPostTurn(
     ).catch(() => {});
   }
 
-  // The student model learns from this turn
+  // v3.0: Attribute Extraction Pipeline (replaces instant_facts)
+  const activeAttributes = await getActiveAttributes(studentId).catch(() => ({}));
+  await extractAttributesFromTurn(
+    studentId,
+    turn.turnId,
+    turn.studentMessage,
+    turn.tutorResponse,
+    perception.primaryIntent,
+    activeAttributes
+  ).catch(err => logger.debug({ err }, '[Crew] Attribute extraction failed'));
+
+  // v3.0: Archetype matching (lightweight, runs after attributes update)
+  await matchArchetypes(studentId).catch(err => logger.debug({ err }, '[Crew] Archetype matching failed'));
+
+  // The student model learns from this turn (legacy pathway, preserved)
   await updateStudentModel(profile, turn.studentMessage, turn.tutorResponse, perception, plan).catch(() => {});
 
   // Curriculum assessment -> knowledge tracing, spaced repetition, progress
@@ -445,7 +477,26 @@ async function runPostTurn(
 
       if (decision.masteryAssessment === 'mastered') {
         await applyMemoryEdit(studentId, 'breakthroughs', 'append', `Mastered "${turn.topic}" on ${new Date().toLocaleDateString('en-NG')}`).catch(() => {});
-        const nextConcept = await suggestNextConcept(studentId, turn.subject || 'general', profile.culturalContext.examBoards?.[0] || 'WAEC').catch(() => null);
+        
+        // v3.0: Use AI navigator for next topic suggestion instead of hardcoded graph
+        const navDecision = await decideNextTopic({
+          studentId,
+          currentTopic: turn.topic,
+          currentSubject: turn.subject || 'general',
+          studentMessage: turn.studentMessage,
+          perceptionIntent: perception.primaryIntent,
+          bktMastery: Object.fromEntries(
+            Object.entries(profile.conceptProgress || {}).map(([k, v]) => [k, v.masteryLevel])
+          ),
+          recentErrors: [],
+          emotionalState: {
+            frustration: perception.emotionalSignals.frustration,
+            curiosity: perception.emotionalSignals.curiosity,
+            selfEfficacy: perception.emotionalSignals.selfEfficacy,
+          },
+        }).catch(() => null);
+
+        const nextConcept = navDecision?.nextTopic;
         await queueNotification(
           studentId, 'breakthrough_celebration',
           `Student just mastered "${turn.topic}". Celebrate specifically.${nextConcept ? ` Suggest "${nextConcept}" as the next mountain to climb.` : ''}`,
