@@ -1,11 +1,12 @@
 /**
- * Tool registry: the tutor's hands. v2 dispatches tools named by the
- * deliberation plan (needsTools) instead of v1's rigid "exam_prep phase =>
- * always search" rule, so tools run when reasoning says they help.
+ * Tool registry — v3.0: delegates to the dynamic tool system.
+ *
+ * The old hardcoded switch statement has been replaced. This module now
+ * serves as a thin compatibility layer that reads from the tools table
+ * and delegates to src/tools/implementations.ts.
  */
-import { searchForCurriculum, findPastExamQuestions } from './search';
-import { getDueReviews } from '../features/spaced_repetition';
-import { generateStudyPlan } from '../features/study_plan';
+import { executeToolByName } from './implementations';
+import { db } from '../db/client';
 import { logger } from '../middleware/logger';
 
 export interface ToolDefinition {
@@ -13,56 +14,29 @@ export interface ToolDefinition {
   description: string;
 }
 
-export const TOOL_DEFINITIONS: ToolDefinition[] = [
-  { name: 'search_curriculum', description: 'Search WAEC/JAMB/NECO syllabus info for a topic' },
-  { name: 'search_past_questions', description: 'Find past exam questions for a topic' },
-  { name: 'get_due_reviews', description: 'Concepts the student has due for spaced review' },
-  { name: 'generate_study_plan', description: 'Create a week-by-week study plan' },
-  { name: 'recall_past_moments', description: 'Semantically recall relevant past conversations' },
-];
+/**
+ * Get tool definitions for prompt injection.
+ * Reads from the dynamic tools table.
+ */
+export async function getToolDefinitions(): Promise<ToolDefinition[]> {
+  const result = await db.query(
+    `SELECT name, description FROM tools WHERE is_enabled = true ORDER BY name`
+  );
+  return result.rows.map((r: Record<string, unknown>) => ({
+    name: r.name as string,
+    description: r.description as string,
+  }));
+}
 
+/**
+ * Legacy executeTool function — now delegates to the dynamic system.
+ */
 export async function executeTool(
   toolName: string,
   params: Record<string, unknown>,
   studentId: string
 ): Promise<string> {
-  logger.info(`[ToolRegistry] Executing: ${toolName}`);
-
-  switch (toolName) {
-    case 'search_curriculum':
-      return await searchForCurriculum(params.query as string, (params.examBoard as string) || 'WAEC') || 'No curriculum info found.';
-
-    case 'search_past_questions':
-      return await findPastExamQuestions(params.topic as string, (params.examBoard as string) || 'WAEC') || 'No past questions found.';
-
-    case 'get_due_reviews': {
-      const reviews = await getDueReviews(studentId);
-      return reviews.length === 0
-        ? 'No concepts due for review.'
-        : `Due: ${reviews.map(r => `${r.concept} (${r.urgency})`).join(', ')}`;
-    }
-
-    case 'generate_study_plan': {
-      const plan = await generateStudyPlan(
-        studentId,
-        params.subject as string,
-        new Date(params.examDate as string),
-        ((params.conceptGaps as string) || '').split(',').map(s => s.trim()).filter(Boolean),
-        []
-      );
-      return `Study plan created: ${plan.weeklyTargets.length} weeks, first week: ${plan.weeklyTargets[0]?.concepts.join(', ') || 'revision'}`;
-    }
-
-    case 'recall_past_moments': {
-      const { recallRelevantEpisodes } = await import('../memory/episodic');
-      const episodes = await recallRelevantEpisodes(studentId, params.query as string, 3);
-      if (episodes.length === 0) return 'No relevant past conversations found.';
-      return episodes.map(e =>
-        `Past: Student said "${e.studentMessage.slice(0, 80)}" | Tutor: "${e.tutorResponse.slice(0, 80)}"`
-      ).join('\n');
-    }
-
-    default:
-      return `Unknown tool: ${toolName}`;
-  }
+  logger.info(`[ToolRegistry] Delegating: ${toolName}`);
+  const result = await executeToolByName(toolName, params, studentId);
+  return result.success ? result.output : result.error || `Tool ${toolName} failed`;
 }
