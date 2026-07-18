@@ -1,17 +1,12 @@
 /**
- * PostgreSQL client + schema v2.
+ * PostgreSQL client + schema v3.
  *
- * Schema changes vs v1 (all additive and migration-safe — CREATE IF NOT EXISTS
+ * Schema changes vs v2 (all additive and migration-safe — CREATE IF NOT EXISTS
  * and ALTER ... IF NOT EXISTS only):
- * - sessions gains a `state` JSONB column (persistent per-session teaching
- *   state: current concept, hint level, approaches tried, struggle count).
- * - conversation_turns gains `embedding_provider` so vector recall never mixes
- *   real model embeddings with the deterministic fallback in one search space.
- * - student_facts: NEW table — structured extracted facts about the learner.
- * - notification_queue gains `dedupe_key` with a UNIQUE index. v1 had
- *   ON CONFLICT DO NOTHING with no constraint, so the brain agent queued
- *   duplicate WhatsApp messages every 60 seconds. This was the spam bug.
- * - cost_tracking gains `purpose` (which part of the pipeline spent it).
+ * - v2: sessions state JSONB, embedding_provider, student_facts, dedupe_key, purpose.
+ * - v3: student_attributes (dynamic learner model), student_archetypes (clustering),
+ *   syllabus_chunks (vector store), tools (dynamic registry), observability logs,
+ *   onboarding_state (goal-driven discovery).
  */
 import { Pool } from 'pg';
 import { logger } from '../middleware/logger';
@@ -86,7 +81,7 @@ export async function initializeDatabase(): Promise<void> {
       ON conversation_turns USING ivfflat (embedding vector_cosine_ops)
       WITH (lists = 100)
     `);
-  } catch { /* ivfflat needs rows first — recreated by the compressor worker later */ }
+  } catch { /* ivfflat needs rows first */ }
 
   await db.query(`
     CREATE TABLE IF NOT EXISTS student_profiles (
@@ -107,6 +102,8 @@ export async function initializeDatabase(): Promise<void> {
       symbolic_knowledge JSONB DEFAULT '{}'
     )
   `);
+  await db.query(`ALTER TABLE student_profiles ADD COLUMN IF NOT EXISTS archetype_id UUID`);
+  await db.query(`ALTER TABLE student_profiles ADD COLUMN IF NOT EXISTS attribute_summary TEXT`);
 
   await db.query(`
     CREATE TABLE IF NOT EXISTS student_facts (
@@ -118,6 +115,167 @@ export async function initializeDatabase(): Promise<void> {
       updated_at TIMESTAMPTZ DEFAULT NOW(),
       PRIMARY KEY (student_id, fact_key)
     )
+  `);
+
+  // ──────────────────────────────────────────────
+  // v3.0: Dynamic Student Attributes
+  // ──────────────────────────────────────────────
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS student_attributes (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      student_id TEXT NOT NULL,
+      attribute_key TEXT NOT NULL,
+      attribute_value JSONB NOT NULL,
+      confidence FLOAT NOT NULL CHECK (confidence >= 0.0 AND confidence <= 1.0),
+      evidence_json JSONB NOT NULL DEFAULT '[]',
+      category TEXT NOT NULL CHECK (category IN ('goal', 'cognitive_preference', 'affective_state', 'contextual_factor', 'metacognitive_trait')),
+      first_observed TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      last_updated TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      is_active BOOLEAN NOT NULL DEFAULT false,
+      UNIQUE(student_id, attribute_key)
+    );
+    CREATE INDEX IF NOT EXISTS idx_student_attributes_student ON student_attributes(student_id);
+    CREATE INDEX IF NOT EXISTS idx_student_attributes_key ON student_attributes(attribute_key);
+    CREATE INDEX IF NOT EXISTS idx_student_attributes_category ON student_attributes(category);
+    CREATE INDEX IF NOT EXISTS idx_student_attributes_confidence ON student_attributes(confidence) WHERE is_active = true;
+  `);
+
+  // ──────────────────────────────────────────────
+  // v3.0: Student Archetypes (clustering)
+  // ──────────────────────────────────────────────
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS student_archetypes (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      name TEXT NOT NULL,
+      description TEXT NOT NULL,
+      centroid_vector VECTOR(1536),
+      member_count INT NOT NULL DEFAULT 0,
+      is_discovered BOOLEAN NOT NULL DEFAULT false,
+      config JSONB NOT NULL DEFAULT '{}',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS student_archetype_memberships (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      student_id TEXT NOT NULL,
+      archetype_id UUID NOT NULL REFERENCES student_archetypes(id) ON DELETE CASCADE,
+      similarity_score FLOAT NOT NULL,
+      assigned_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      UNIQUE(student_id, archetype_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_archetype_memberships_student ON student_archetype_memberships(student_id);
+  `);
+
+  // ──────────────────────────────────────────────
+  // v3.0: Syllabus Vector Store
+  // ──────────────────────────────────────────────
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS syllabus_chunks (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      subject TEXT NOT NULL,
+      exam_board TEXT NOT NULL,
+      level TEXT NOT NULL,
+      topic TEXT NOT NULL,
+      sub_topic TEXT NOT NULL,
+      objectives TEXT[] NOT NULL DEFAULT '{}',
+      exam_weight FLOAT,
+      related_topics TEXT[] NOT NULL DEFAULT '{}',
+      content_text TEXT NOT NULL,
+      source_reference TEXT,
+      embedding VECTOR(1536),
+      metadata JSONB NOT NULL DEFAULT '{}',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_syllabus_embedding ON syllabus_chunks USING ivfflat (embedding vector_cosine_ops);
+    CREATE INDEX IF NOT EXISTS idx_syllabus_subject ON syllabus_chunks(subject);
+    CREATE INDEX IF NOT EXISTS idx_syllabus_exam_board ON syllabus_chunks(exam_board);
+  `);
+
+  // ──────────────────────────────────────────────
+  // v3.0: Dynamic Tool Registry
+  // ──────────────────────────────────────────────
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS tools (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      name TEXT NOT NULL UNIQUE,
+      description TEXT NOT NULL,
+      input_schema JSONB NOT NULL,
+      handler_module TEXT NOT NULL,
+      is_enabled BOOLEAN NOT NULL DEFAULT true,
+      requires_config JSONB NOT NULL DEFAULT '[]',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_tools_enabled ON tools(is_enabled);
+  `);
+
+  // ──────────────────────────────────────────────
+  // v3.0: Observability Tables
+  // ──────────────────────────────────────────────
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS attribute_extraction_logs (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      student_id TEXT NOT NULL,
+      turn_id TEXT,
+      raw_llm_output JSONB NOT NULL,
+      parsed_candidates JSONB NOT NULL,
+      accepted_attributes JSONB NOT NULL,
+      rejected_attributes JSONB NOT NULL,
+      latency_ms INT,
+      model_used TEXT,
+      timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_attr_logs_student ON attribute_extraction_logs(student_id);
+  `);
+
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS tool_call_logs (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      student_id TEXT NOT NULL,
+      session_id TEXT,
+      tool_name TEXT NOT NULL,
+      tool_input JSONB NOT NULL,
+      tool_output JSONB,
+      latency_ms INT,
+      tutor_decision_reason TEXT,
+      error TEXT,
+      timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_tool_logs_student ON tool_call_logs(student_id);
+  `);
+
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS tutor_decision_logs (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      student_id TEXT NOT NULL,
+      session_id TEXT,
+      turn_number INT,
+      decision_type TEXT NOT NULL,
+      reasoning TEXT NOT NULL,
+      context_snapshot JSONB NOT NULL,
+      selected_topic TEXT,
+      selected_strategy TEXT,
+      tools_considered TEXT[],
+      timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_decision_logs_student ON tutor_decision_logs(student_id);
+  `);
+
+  // ──────────────────────────────────────────────
+  // v3.0: Onboarding State
+  // ──────────────────────────────────────────────
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS onboarding_state (
+      student_id TEXT PRIMARY KEY,
+      is_complete BOOLEAN NOT NULL DEFAULT false,
+      discovery_goals_satisfied JSONB NOT NULL DEFAULT '{}',
+      turns_completed INT NOT NULL DEFAULT 0,
+      last_goal_attempted TEXT,
+      dropped_off_at_goal TEXT,
+      started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      completed_at TIMESTAMPTZ,
+      resumed_count INT NOT NULL DEFAULT 0
+    );
   `);
 
   await db.query(`
@@ -265,5 +423,98 @@ export async function initializeDatabase(): Promise<void> {
     )
   `);
 
-  logger.info('[DB] Schema v2 initialized');
+  // Seed defaults
+  await seedDefaultArchetypes();
+  await seedDefaultTools();
+
+  logger.info('[DB] Schema v3 initialized');
+}
+
+async function seedDefaultArchetypes(): Promise<void> {
+  const archetypes = [
+    {
+      name: 'panic_crammer',
+      description: 'High exam pressure, low time, high anxiety. Needs concise, exam-relevant content.',
+      config: { rules: [{ attribute_key: 'exam_pressure', operator: 'gt', value: 0.7 }, { attribute_key: 'time_available', operator: 'lt', value: 0.3 }] },
+    },
+    {
+      name: 'deep_diver',
+      description: 'High curiosity, low exam pressure, prefers theory and connections. Needs depth and exploration room.',
+      config: { rules: [{ attribute_key: 'curiosity_level', operator: 'gt', value: 0.7 }, { attribute_key: 'exam_pressure', operator: 'lt', value: 0.3 }] },
+    },
+    {
+      name: 'homework_helper',
+      description: 'Sporadic engagement, seeks quick answers. Needs bite-sized, just-in-time help.',
+      config: { rules: [{ attribute_key: 'engagement_pattern', operator: 'eq', value: 'sporadic' }] },
+    },
+    {
+      name: 'steady_builder',
+      description: 'Regular engagement, methodical progress. Needs structured, scaffolded learning.',
+      config: { rules: [{ attribute_key: 'engagement_pattern', operator: 'eq', value: 'regular' }] },
+    },
+    {
+      name: 'confidence_seeker',
+      description: 'Low self-efficacy, needs reassurance and small wins. Needs frequent celebration and gentle pacing.',
+      config: { rules: [{ attribute_key: 'self_efficacy', operator: 'lt', value: 0.4 }] },
+    },
+  ];
+
+  for (const a of archetypes) {
+    await db.query(
+      `INSERT INTO student_archetypes (name, description, config, is_discovered)
+       VALUES ($1, $2, $3, false)
+       ON CONFLICT DO NOTHING`,
+      [a.name, a.description, JSON.stringify(a.config)]
+    );
+  }
+}
+
+async function seedDefaultTools(): Promise<void> {
+  const tools = [
+    {
+      name: 'syllabus_query',
+      description: 'Search the syllabus vector store for topics, objectives, and exam coverage.',
+      input_schema: { type: 'object', properties: { subject: { type: 'string' }, query: { type: 'string' }, exam_board: { type: 'string' }, level: { type: 'string' } }, required: ['query'] },
+      handler_module: 'src/tools/implementations.ts',
+    },
+    {
+      name: 'web_search',
+      description: 'Search the web for current events, real-world examples, and fresh context.',
+      input_schema: { type: 'object', properties: { query: { type: 'string' }, max_results: { type: 'number', default: 5 } }, required: ['query'] },
+      handler_module: 'src/tools/implementations.ts',
+    },
+    {
+      name: 'calculator',
+      description: 'Evaluate mathematical expressions with step-by-step working.',
+      input_schema: { type: 'object', properties: { expression: { type: 'string' } }, required: ['expression'] },
+      handler_module: 'src/tools/implementations.ts',
+    },
+    {
+      name: 'code_interpreter',
+      description: 'Run Python code for simulations, visualizations, and algorithmic explanations.',
+      input_schema: { type: 'object', properties: { code: { type: 'string' }, language: { type: 'string', default: 'python' } }, required: ['code'] },
+      handler_module: 'src/tools/implementations.ts',
+    },
+    {
+      name: 'concept_lookup',
+      description: 'Define any academic term with examples and related concepts.',
+      input_schema: { type: 'object', properties: { term: { type: 'string' }, subject: { type: 'string' }, context: { type: 'string' } }, required: ['term'] },
+      handler_module: 'src/tools/implementations.ts',
+    },
+    {
+      name: 'past_question_retrieval',
+      description: 'Fetch WAEC/JAMB past questions for practice.',
+      input_schema: { type: 'object', properties: { subject: { type: 'string' }, topic: { type: 'string' }, exam_board: { type: 'string' }, year_range: { type: 'array', items: { type: 'number' } }, limit: { type: 'number', default: 5 } }, required: ['subject', 'topic'] },
+      handler_module: 'src/tools/implementations.ts',
+    },
+  ];
+
+  for (const t of tools) {
+    await db.query(
+      `INSERT INTO tools (name, description, input_schema, handler_module, is_enabled)
+       VALUES ($1, $2, $3, $4, true)
+       ON CONFLICT (name) DO NOTHING`,
+      [t.name, t.description, JSON.stringify(t.input_schema), t.handler_module]
+    );
+  }
 }
