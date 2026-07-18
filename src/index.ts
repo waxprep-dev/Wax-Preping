@@ -1,217 +1,256 @@
 /**
- * WaxPrep v1.0 — main server.
+ * WaxPrep v3.0 — AI Tutor Backend.
  *
- * Boot order (unchanged from v1, which was correct): HTTP first so the
- * platform healthcheck passes immediately, then DB, event bus, and brain
- * status in the background.
- *
- * New in v2:
- * - /students/:id/memory — inspect the student model (admin).
- * - /students/:id/facts — inspect extracted facts (admin).
- * - Event subscriptions now cover the full event vocabulary.
+ * Entry point. Initializes the database, starts the Express server,
+ * wires up the WhatsApp webhook, and registers admin routes for the
+ * new cognitive architecture (attributes, archetypes, syllabus, tools).
  */
 import 'dotenv/config';
-import express from 'express';
+import express, { Request, Response } from 'express';
 import { initializeDatabase } from './db/client';
-import { eventBus } from './events/bus';
 import { createWebhookRouter } from './whatsapp/webhook';
-import { getBrainStatus } from './brain/llama_server';
-import { getConstitution, setConstitution } from './config/constitution';
 import { logger } from './middleware/logger';
-import { bootstrapCurriculum } from './curriculum/engine';
-import type { MasteryDetected, DefenseTriggered, EmotionalAlert, PromptEvolved } from './types/events';
+import { db } from './db/client';
+import { searchSyllabus, getAvailableSubjects, getTopicsForSubject } from './syllabus/store';
+import { ingestSyllabusDirectory } from './syllabus/ingest';
+import { getActiveAttributes, getPromptGradeAttributes } from './student_profile/attribute_pipeline';
+import { matchArchetypes, warmStartFromArchetype } from './student_profile/archetypes';
+import { getOnboardingState } from './onboarding/engine';
+import { executeToolByName } from './tools/implementations';
 
-async function main(): Promise<void> {
-  const app = express();
+const app = express();
+const PORT = process.env.PORT || 3000;
 
-  // Capture the raw request body so the WhatsApp webhook can verify Meta's
-  // X-Hub-Signature-256 HMAC against the exact bytes that were signed.
-  app.use(express.json({
-    limit: '15mb',
-    verify: (req: express.Request, _res: express.Response, buf: Buffer) => {
-      (req as express.Request & { rawBody?: Buffer }).rawBody = buf;
-    },
-  }));
-
-  let brainOnline = false;
-  let routerOnline = false;
-
-  const port = parseInt(process.env.PORT || '3000', 10);
-  app.listen(port, '0.0.0.0', () => {
-    logger.info(`[WaxPrep] HTTP server listening on port ${port}`);
-  });
-
-  app.get('/health', (_req, res) => {
-    res.json({
-      status: 'ok',
-      version: '1.0.0',
-      brain: brainOnline ? 'online' : 'cloud-fallback',
-      router: routerOnline ? 'online' : 'cloud-fallback',
-      uptime: process.uptime(),
-      timestamp: new Date().toISOString(),
-    });
-  });
-
-  app.get('/ready', (_req, res) => res.json({ ready: true }));
-
-  logger.info('[WaxPrep] Starting v2.0.0 — Unified Cognitive Architecture');
-
-  try {
-    await initializeDatabase();
-    await bootstrapCurriculum().catch(err => logger.warn({ err }, '[WaxPrep] Curriculum bootstrap failed'));;
-    logger.info('[WaxPrep] Database initialized (schema v2)');
-  } catch (err) {
-    logger.error({ err }, '[WaxPrep] Database initialization failed');
-  }
-
-  try {
-    await eventBus.connect();
-  } catch (err) {
-    logger.error({ err }, '[WaxPrep] EventBus connection failed');
-  }
-
-  getBrainStatus()
-    .then((status: { brainOnline: boolean; routerOnline: boolean }) => {
-      brainOnline = status.brainOnline;
-      routerOnline = status.routerOnline;
-      logger.info(`[WaxPrep] Brain (on-prem): ${brainOnline ? 'ONLINE' : 'OFFLINE → cloud'}`);
-      logger.info(`[WaxPrep] Router (on-prem): ${routerOnline ? 'ONLINE' : 'OFFLINE → cloud'}`);
-    })
-    .catch((err: unknown) => {
-      logger.warn({ err }, '[WaxPrep] Brain status check failed — using cloud fallback');
-    });
-
-  try {
-    const constitution = await getConstitution();
-    logger.info(`[WaxPrep] Constitution loaded: ${constitution.split('\n')[0]}`);
-  } catch (err) {
-    logger.warn({ err }, '[WaxPrep] Could not load constitution');
-  }
-
-  // ── Event observability ─────────────────────────────────────────────────
-  eventBus.subscribe<MasteryDetected>('mastery.detected', async event => {
-    logger.info(`[Event] MASTERY: ${event.studentId} → "${event.concept}" (${event.masteryLevel.toFixed(2)})`);
-  });
-
-  eventBus.subscribe<DefenseTriggered>('defense.triggered', async event => {
-    if (event.severity === 'critical') logger.warn(`[Event] DEFENSE CRITICAL: ${event.layer}: ${event.issue}`);
-  });
-
-  eventBus.subscribe<EmotionalAlert>('emotional.alert', async event => {
-    if (event.urgency === 'immediate') {
-      logger.warn(`[Event] EMOTIONAL ALERT: ${event.studentId} — ${event.emotion} (${event.confidence.toFixed(2)})`);
-    }
-  });
-
-  eventBus.subscribe<PromptEvolved>('prompt.evolved', async event => {
-    logger.info(`[Event] PROMPT EVOLVED: ${event.componentId} ${event.oldFitness.toFixed(3)} → ${event.newFitness.toFixed(3)}`);
-  });
-
-  // ── Admin API ───────────────────────────────────────────────────────────
-  const adminOnly = (req: express.Request, res: express.Response, next: express.NextFunction) => {
-    const key = (req.headers['x-admin-key'] || req.body?.adminKey || req.query.adminKey) as string;
-    if (!process.env.ADMIN_KEY || key !== process.env.ADMIN_KEY) {
-      return res.status(403).json({ error: 'Unauthorized' });
-    }
+// Capture raw body for Meta signature verification BEFORE express.json() parses
+app.use((req: Request, res, next) => {
+  let data = '';
+  req.setEncoding('utf8');
+  req.on('data', chunk => { data += chunk; });
+  req.on('end', () => {
+    (req as Request & { rawBody?: Buffer }).rawBody = Buffer.from(data);
     next();
-  };
-
-  app.get('/constitution', async (_req, res) => {
-    try {
-      const c = await getConstitution();
-      res.json({ constitution: c });
-    } catch {
-      res.status(500).json({ error: 'Constitution unavailable' });
-    }
   });
+});
 
-  app.post('/constitution', adminOnly, async (req, res) => {
-    const { content } = req.body as { content: string };
-    if (!content || content.length < 50) return res.status(400).json({ error: 'content required' });
-    try {
-      await setConstitution(content);
-      res.json({ success: true });
-    } catch {
-      res.status(500).json({ error: 'Failed to update constitution' });
+app.use(express.json());
+app.use(logger);
+
+app.get('/health', (_req: Request, res: Response) => {
+  res.status(200).json({ status: 'ok', version: '3.0.0-cognitive' });
+});
+
+// ── Admin Routes: Student Profile ────────────────────────────────────────
+
+app.get('/admin/students/:studentId/attributes', async (req: Request, res: Response) => {
+  try {
+    const attrs = await getActiveAttributes(req.params.studentId);
+    res.json({ studentId: req.params.studentId, attributes: attrs });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch attributes' });
+  }
+});
+
+app.get('/admin/students/:studentId/archetypes', async (req: Request, res: Response) => {
+  try {
+    const result = await db.query(
+      `SELECT a.name, a.description, m.similarity_score, m.assigned_at
+       FROM student_archetypes a
+       JOIN student_archetype_memberships m ON a.id = m.archetype_id
+       WHERE m.student_id = $1
+       ORDER BY m.similarity_score DESC`,
+      [req.params.studentId]
+    );
+    res.json({ studentId: req.params.studentId, archetypes: result.rows });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch archetypes' });
+  }
+});
+
+app.post('/admin/students/:studentId/archetypes/refresh', async (req: Request, res: Response) => {
+  try {
+    const matches = await matchArchetypes(req.params.studentId);
+    res.json({ studentId: req.params.studentId, matches });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to refresh archetypes' });
+  }
+});
+
+app.post('/admin/students/:studentId/archetypes/warm-start', async (req: Request, res: Response) => {
+  try {
+    await warmStartFromArchetype(req.params.studentId);
+    res.json({ studentId: req.params.studentId, status: 'warm-started' });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to warm-start' });
+  }
+});
+
+app.get('/admin/students/:studentId/onboarding', async (req: Request, res: Response) => {
+  try {
+    const state = await getOnboardingState(req.params.studentId);
+    res.json({ studentId: req.params.studentId, onboarding: state });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch onboarding state' });
+  }
+});
+
+// ── Admin Routes: Syllabus ───────────────────────────────────────────────
+
+app.get('/admin/syllabus/search', async (req: Request, res: Response) => {
+  try {
+    const { query, subject, exam_board, level, topic, limit } = req.query;
+    const results = await searchSyllabus({
+      query: String(query || ''),
+      subject: subject ? String(subject) : undefined,
+      examBoard: exam_board ? String(exam_board) : undefined,
+      level: level ? String(level) : undefined,
+      topic: topic ? String(topic) : undefined,
+      limit: limit ? parseInt(String(limit), 10) : 5,
+    });
+    res.json({ query: String(query), results });
+  } catch (err) {
+    res.status(500).json({ error: 'Syllabus search failed' });
+  }
+});
+
+app.get('/admin/syllabus/subjects', async (_req: Request, res: Response) => {
+  try {
+    const subjects = await getAvailableSubjects();
+    res.json({ subjects });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch subjects' });
+  }
+});
+
+app.get('/admin/syllabus/subjects/:subject/topics', async (req: Request, res: Response) => {
+  try {
+    const topics = await getTopicsForSubject(req.params.subject, req.query.exam_board as string | undefined);
+    res.json({ subject: req.params.subject, topics });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch topics' });
+  }
+});
+
+app.post('/admin/syllabus/ingest', async (req: Request, res: Response) => {
+  try {
+    const { directory } = req.body;
+    if (!directory || typeof directory !== 'string') {
+      res.status(400).json({ error: 'directory path required' });
+      return;
     }
-  });
+    const result = await ingestSyllabusDirectory(directory);
+    res.json({ directory, ...result });
+  } catch (err) {
+    res.status(500).json({ error: 'Ingestion failed' });
+  }
+});
 
-  app.get('/students/:studentId/memory', adminOnly, async (req, res) => {
-    try {
-      const { getStudentProfile } = await import('./memory/semantic');
-      const profile = await getStudentProfile(req.params.studentId);
-      res.json({
-        memoryBlocks: profile.memoryBlocks,
-        conceptProgress: profile.conceptProgress,
-        errorDiary: profile.errorDiary,
-        analogyLibrary: profile.analogyLibrary,
-        studyStreak: profile.studyStreak,
-        totalTurns: profile.totalTurns,
-      });
-    } catch {
-      res.status(500).json({ error: 'Memory unavailable' });
+// ── Admin Routes: Tools ──────────────────────────────────────────────────
+
+app.get('/admin/tools', async (_req: Request, res: Response) => {
+  try {
+    const result = await db.query(`SELECT name, description, is_enabled, input_schema FROM tools ORDER BY name`);
+    res.json({ tools: result.rows });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch tools' });
+  }
+});
+
+app.post('/admin/tools/:toolName/toggle', async (req: Request, res: Response) => {
+  try {
+    const { enabled } = req.body;
+    await db.query(`UPDATE tools SET is_enabled = $1, updated_at = NOW() WHERE name = $2`, [enabled === true, req.params.toolName]);
+    res.json({ tool: req.params.toolName, enabled: enabled === true });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to toggle tool' });
+  }
+});
+
+app.post('/admin/tools/:toolName/invoke', async (req: Request, res: Response) => {
+  try {
+    const { studentId, params } = req.body;
+    const result = await executeToolByName(req.params.toolName, params || {}, studentId || 'admin');
+    res.json({ tool: req.params.toolName, result });
+  } catch (err) {
+    res.status(500).json({ error: 'Tool invocation failed' });
+  }
+});
+
+// ── Admin Routes: Observability ──────────────────────────────────────────
+
+app.get('/admin/observability/attribute-extraction', async (req: Request, res: Response) => {
+  try {
+    const { student_id, limit = '50' } = req.query;
+    let query = `SELECT * FROM attribute_extraction_logs`;
+    const params: unknown[] = [];
+    if (student_id) {
+      query += ` WHERE student_id = $1`;
+      params.push(student_id);
     }
-  });
+    query += ` ORDER BY timestamp DESC LIMIT $${params.length + 1}`;
+    params.push(parseInt(String(limit), 10));
+    const result = await db.query(query, params);
+    res.json({ logs: result.rows });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch logs' });
+  }
+});
 
-  app.get('/students/:studentId/facts', adminOnly, async (req, res) => {
-    try {
-      const { db } = await import('./db/client');
-      const result = await db.query(`SELECT * FROM student_facts WHERE student_id = $1 ORDER BY confidence DESC`, [req.params.studentId]);
-      res.json({ facts: result.rows });
-    } catch {
-      res.status(500).json({ error: 'Facts unavailable' });
+app.get('/admin/observability/tool-calls', async (req: Request, res: Response) => {
+  try {
+    const { student_id, tool_name, limit = '50' } = req.query;
+    const conditions: string[] = [];
+    const params: unknown[] = [];
+    if (student_id) {
+      conditions.push(`student_id = $${params.length + 1}`);
+      params.push(student_id);
     }
-  });
-
-  app.get('/metrics', async (_req, res) => {
-    try {
-      const { db } = await import('./db/client');
-      const [students, sessions, turns, notifs, defenses, reflections, cost] = await Promise.all([
-        db.query('SELECT COUNT(*) FROM student_profiles'),
-        db.query(`SELECT COUNT(*) FROM sessions WHERE started_at > NOW() - INTERVAL '24 hours'`),
-        db.query(`SELECT COUNT(*) FROM conversation_turns WHERE timestamp > NOW() - INTERVAL '24 hours'`),
-        db.query(`SELECT COUNT(*) FROM notification_queue WHERE sent = TRUE AND sent_at > NOW() - INTERVAL '24 hours'`),
-        db.query(`SELECT COUNT(*) FROM defense_log WHERE timestamp > NOW() - INTERVAL '24 hours'`),
-        db.query(`SELECT AVG(confidence_score) FROM ai_reflections WHERE timestamp > NOW() - INTERVAL '24 hours'`),
-        db.query(`SELECT COALESCE(SUM(cost_usd),0) as total, COALESCE(SUM(tokens_in),0) as tin, COALESCE(SUM(tokens_out),0) as tout FROM cost_tracking WHERE timestamp > NOW() - INTERVAL '24 hours'`),
-      ]);
-
-      res.json({
-        version: '1.0.0',
-        totalStudents: parseInt(students.rows[0].count),
-        sessionsLast24h: parseInt(sessions.rows[0].count),
-        turnsLast24h: parseInt(turns.rows[0].count),
-        notificationsSentLast24h: parseInt(notifs.rows[0].count),
-        defenseTriggers24h: parseInt(defenses.rows[0].count),
-        avgReflectionConfidence: parseFloat(reflections.rows[0].avg || '0').toFixed(3),
-        cost24hUsd: parseFloat(cost.rows[0].total).toFixed(4),
-        tokens24h: { in: parseInt(cost.rows[0].tin), out: parseInt(cost.rows[0].tout) },
-        brainOnline,
-      });
-    } catch {
-      res.status(500).json({ error: 'Metrics unavailable' });
+    if (tool_name) {
+      conditions.push(`tool_name = $${params.length + 1}`);
+      params.push(tool_name);
     }
-  });
+    let query = `SELECT * FROM tool_call_logs`;
+    if (conditions.length > 0) query += ` WHERE ${conditions.join(' AND ')}`;
+    query += ` ORDER BY timestamp DESC LIMIT $${params.length + 1}`;
+    params.push(parseInt(String(limit), 10));
+    const result = await db.query(query, params);
+    res.json({ logs: result.rows });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch logs' });
+  }
+});
 
-  app.get('/world-model/:studentId', adminOnly, async (req, res) => {
-    try {
-      const { getWorldModelState } = await import('./world_model/predictive_model');
-      const state = await getWorldModelState(req.params.studentId);
-      if (!state) return res.status(404).json({ error: 'No world model yet for this student' });
-      res.json(state);
-    } catch {
-      res.status(500).json({ error: 'World model unavailable' });
+app.get('/admin/observability/decisions', async (req: Request, res: Response) => {
+  try {
+    const { student_id, limit = '50' } = req.query;
+    let query = `SELECT * FROM tutor_decision_logs`;
+    const params: unknown[] = [];
+    if (student_id) {
+      query += ` WHERE student_id = $1`;
+      params.push(student_id);
     }
+    query += ` ORDER BY timestamp DESC LIMIT $${params.length + 1}`;
+    params.push(parseInt(String(limit), 10));
+    const result = await db.query(query, params);
+    res.json({ logs: result.rows });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch logs' });
+  }
+});
+
+// ── WhatsApp Webhook ───────────────────────────────────────────────────
+
+app.use('/whatsapp', createWebhookRouter());
+
+// ── Startup ──────────────────────────────────────────────────────────────
+
+async function main() {
+  await initializeDatabase();
+  app.listen(PORT, () => {
+    logger.info(`[Server] WaxPrep v3.0 listening on port ${PORT}`);
   });
-
-  app.use('/', createWebhookRouter());
-
-  logger.info('[WaxPrep] Pipeline: Perceive → Deliberate → Generate → Defend → Learn');
-  logger.info('[WaxPrep] Memory: working + episodic (recall wired) + semantic + student model');
-  logger.info('[WaxPrep] Backend brain, world model, evolution — all autonomous');
 }
 
 main().catch(err => {
-  logger.fatal({ err }, '[WaxPrep] Fatal startup error');
+  logger.error({ err }, '[Server] Fatal startup error');
   process.exit(1);
 });
