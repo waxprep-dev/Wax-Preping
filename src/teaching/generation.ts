@@ -5,8 +5,8 @@
  * WhatsApp message. One smart-tier call. The plan is rendered as compact
  * instructions; the generation prompt (DB-evolvable) governs voice.
  *
- * v1: plan brief now carries hard question budget + teach-content flags
- * so the model cannot "helpfully" append a quiz when policy forbids it.
+ * v3.0: Archetype guidance and dynamic attributes flow through subjectContext.
+ * The generation prompt seed now includes archetype adaptation instructions.
  */
 import { routeAndCall } from '../llm/router';
 import { getPrompt } from '../config/prompts';
@@ -51,6 +51,7 @@ export async function generate(ctx: TurnContext, plan: TeachingPlan): Promise<LL
     knownFacts ? `Known facts about this student (use them — do not re-ask): ${knownFacts}` : '',
     ctx.recalledEpisodes ? `Past moments you may reference:\n${ctx.recalledEpisodes}` : '',
     ctx.toolContext ? `Resources available:\n${ctx.toolContext.slice(0, 600)}` : '',
+    ctx.subjectContext ? `STUDENT CONTEXT:\n${ctx.subjectContext}` : '',
     `Recent conversation:\n${ctx.conversationHistory.slice(-1200) || 'This is the start of your relationship.'}`,
     '',
     `STUDENT'S MESSAGE: "${ctx.perception.rawMessage.slice(0, 800)}"`,
@@ -65,14 +66,12 @@ export async function generate(ctx: TurnContext, plan: TeachingPlan): Promise<LL
     { role: 'user', content: situation },
   ], { tier: 'smart', maxTokens: 900, temperature: 0.7, studentId: ctx.studentId, purpose: 'generation' });
 
-  // Hard post-filter: if policy forbids questions, strip trailing question sentences.
   if (!plan.askQuestion) {
     response.content = stripTrailingQuestions(response.content);
   } else {
     response.content = collapseToSingleTrailingQuestion(response.content);
   }
 
-  // Strip banned robotic openers that still slip through.
   response.content = stripRoboticOpeners(response.content);
 
   return response;
@@ -82,12 +81,9 @@ function f2(n: number): string {
   return n.toFixed(2);
 }
 
-/** Remove trailing interrogatives when policy forbids questions. */
 export function stripTrailingQuestions(text: string): string {
   if (!text) return text;
   let out = text.trim();
-
-  // Split into sentences roughly; drop trailing ones that are questions.
   const parts = out.split(/(?<=[.!])\s+|\n+/).filter(Boolean);
   while (parts.length > 1) {
     const last = parts[parts.length - 1].trim();
@@ -98,26 +94,19 @@ export function stripTrailingQuestions(text: string): string {
     break;
   }
   out = parts.join(' ').trim();
-
-  // If the whole message is still a single question, convert to a soft statement.
   if (/\?$/.test(out) && out.split('?').length <= 2) {
     out = out.replace(/\?+\s*$/, '.').trim();
   }
-
-  // Soft close if we gutted too much
   if (out.length < 20) {
     return text.replace(/\?/g, '.').trim();
   }
   return out;
 }
 
-/** Keep at most one question, preferably at the end. */
 export function collapseToSingleTrailingQuestion(text: string): string {
   if (!text) return text;
   const marks = (text.match(/\?/g) || []).length;
   if (marks <= 1) return text.trim();
-
-  // Keep the last question; turn earlier ? into .
   const lastIdx = text.lastIndexOf('?');
   const head = text.slice(0, lastIdx).replace(/\?/g, '.');
   const tail = text.slice(lastIdx);
@@ -141,7 +130,6 @@ export function stripRoboticOpeners(text: string): string {
   for (const re of ROBOTIC_OPENERS) {
     out = out.replace(re, '');
   }
-  // Capitalize first letter if we stripped a prefix
   if (out && out[0] === out[0].toLowerCase()) {
     out = out[0].toUpperCase() + out.slice(1);
   }
