@@ -1,15 +1,13 @@
 /**
  * WhatsApp Cloud API webhook.
  *
- * v1 logic preserved (signature verification against the raw body, immediate
- * 200 + async processing, dedupe, rate limiting). v2: isFirstMessage is now
- * computed inside the crew from the profile (single source of truth), so the
- * webhook no longer does its own profile query.
+ * v3.0: Added typing indicator before long operations. Onboarding is handled
+ * inside the crew pipeline, so the webhook remains thin.
  */
 import express, { Request, Response, Router } from 'express';
 import crypto from 'crypto';
 import { processTutorMessage } from '../agents/crew';
-import { sendTextMessage, markAsRead } from './sender';
+import { sendTextMessage, markAsRead, sendTypingIndicator } from './sender';
 import { isMessageProcessed, markMessageProcessed, updateLastSeen } from '../session/manager';
 import { logger } from '../middleware/logger';
 import { checkRateLimit } from '../middleware/rate_limiter';
@@ -33,8 +31,6 @@ export function createWebhookRouter(): Router {
   router.post('/webhook', async (req: Request, res: Response) => {
     res.sendStatus(200);
 
-    // Meta signs the RAW request body — captured by the express.json verify
-    // callback in index.ts. Never re-serialize req.body for verification.
     if (process.env.WHATSAPP_APP_SECRET) {
       const signature = req.headers['x-hub-signature-256'] as string;
       if (!signature) {
@@ -137,6 +133,11 @@ async function handleMessage(message: Record<string, unknown>, phoneNumberId: st
   if (!rawMessage.trim() && !mediaId) return;
 
   try {
+    // v3.0: Send typing indicator before potentially long processing
+    if (phoneNumberId) {
+      await sendTypingIndicator(phoneNumberId, studentId).catch(() => {});
+    }
+
     const responseText = await processTutorMessage({
       studentId, rawMessage, messageId,
       modality: messageType as 'text' | 'image' | 'audio' | 'document' | 'video',
