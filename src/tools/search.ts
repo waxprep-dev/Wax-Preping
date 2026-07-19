@@ -22,13 +22,15 @@ export async function searchBrave(query: string): Promise<SearchResult[]> {
       timeout: 8_000,
     });
 
-    return (response.data.web?.results ?? []).map((r: { title: string; url: string; description: string }) => ({
-      title: r.title,
-      url: r.url,
-      snippet: r.description || '',
-    }));
+    return (response.data.web?.results ?? []).map(
+      (r: { title: string; url: string; description: string }) => ({
+        title: r.title,
+        url: r.url,
+        snippet: r.description || '',
+      })
+    );
   } catch (err) {
-    logger.warn('[Search] Brave failed:');
+    logger.warn({ err }, '[Search] Brave failed');
     return [];
   }
 }
@@ -44,20 +46,34 @@ export async function searchTavily(query: string): Promise<SearchResult[]> {
       { timeout: 10_000 }
     );
 
-    return (response.data.results ?? []).map((r: { title: string; url: string; content: string }) => ({
-      title: r.title,
-      url: r.url,
-      snippet: (r.content || '').slice(0, 300),
-    }));
+    return (response.data.results ?? []).map(
+      (r: { title: string; url: string; content: string }) => ({
+        title: r.title,
+        url: r.url,
+        snippet: (r.content || '').slice(0, 300),
+      })
+    );
   } catch (err) {
-    logger.warn('[Search] Tavily failed:');
+    logger.warn({ err }, '[Search] Tavily failed');
     return [];
   }
 }
 
-export async function searchForCurriculum(query: string, examBoard: string): Promise<string> {
-  const fullQuery = `${examBoard} ${query} syllabus Nigeria 2024 2025`;
-  const [brave, tavily] = await Promise.allSettled([searchBrave(fullQuery), searchTavily(fullQuery)]);
+/**
+ * Curriculum-oriented web search. examBoard is optional and only appended
+ * when the student profile has discovered one — never a hardcoded default.
+ */
+export async function searchForCurriculum(
+  query: string,
+  examBoard?: string | null
+): Promise<string> {
+  const fullQuery = [examBoard, query, 'syllabus curriculum objectives']
+    .filter(Boolean)
+    .join(' ');
+  const [brave, tavily] = await Promise.allSettled([
+    searchBrave(fullQuery),
+    searchTavily(fullQuery),
+  ]);
 
   const results = [
     ...(brave.status === 'fulfilled' ? brave.value : []),
@@ -68,9 +84,28 @@ export async function searchForCurriculum(query: string, examBoard: string): Pro
   return results.map((r, i) => `[${i + 1}] ${r.title}: ${r.snippet}`).join('\n\n');
 }
 
-export async function findPastExamQuestions(topic: string, examBoard: string): Promise<string> {
-  const query = `${examBoard} past questions ${topic} Nigeria exam questions`;
+/**
+ * Live past-exam resource discovery. examBoard optional.
+ * Does NOT serve from a static uploaded bank.
+ */
+export async function findPastExamQuestions(
+  topic: string,
+  examBoard?: string | null
+): Promise<string> {
+  const query = [examBoard, 'past questions', topic, 'exam practice']
+    .filter(Boolean)
+    .join(' ');
   const results = await searchBrave(query);
-  if (results.length === 0) return '';
-  return `Past exam resources:\n${results.slice(0, 3).map(r => `- ${r.title}: ${r.snippet}`).join('\n')}`;
+  if (results.length === 0) {
+    const tavily = await searchTavily(query);
+    if (tavily.length === 0) return '';
+    return `Past exam resources:\n${tavily
+      .slice(0, 3)
+      .map(r => `- ${r.title}: ${r.snippet}`)
+      .join('\n')}`;
+  }
+  return `Past exam resources:\n${results
+    .slice(0, 3)
+    .map(r => `- ${r.title}: ${r.snippet}`)
+    .join('\n')}`;
 }

@@ -78,7 +78,7 @@ export async function ingestSyllabusSections(sections: RawSyllabusSection[]): Pr
 export function parseSyllabusJson(raw: unknown): RawSyllabusSection[] {
   const data = raw as Record<string, unknown>;
   const subject = String(data.subject || 'unknown');
-  const examBoard = String(data.exam_board || 'WAEC');
+  const examBoard = data.exam_board ? String(data.exam_board) : 'unspecified';
   const level = String(data.level || 'SS3');
 
   const sections = Array.isArray(data.sections) ? data.sections : [];

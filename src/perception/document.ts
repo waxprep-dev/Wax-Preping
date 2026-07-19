@@ -30,7 +30,7 @@ export async function analyzeDocument(documentBuffer: Buffer, filename?: string)
 
   const fallback: DocumentAnalysis = {
     rawText: rawText.slice(0, 6000),
-    examBoard: 'WAEC',
+    examBoard: 'unknown',
     subject: 'general',
     topics: [],
     questions: [],

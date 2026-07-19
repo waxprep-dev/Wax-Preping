@@ -5,8 +5,8 @@
  * WhatsApp message. One smart-tier call. The plan is rendered as compact
  * instructions; the generation prompt (DB-evolvable) governs voice.
  *
- * v3.0: Archetype guidance and dynamic attributes flow through subjectContext.
- * The generation prompt seed now includes archetype adaptation instructions.
+ * v3.1: Activation-ranked memories, predictive pre-load, palace path, and
+ * boundary signals flow through dedicated cognitive context fields.
  */
 import { routeAndCall } from '../llm/router';
 import { getPrompt } from '../config/prompts';
@@ -30,28 +30,46 @@ export async function generate(ctx: TurnContext, plan: TeachingPlan): Promise<LL
     `- strategy: ${plan.strategy} (${plan.strategyReason})`,
     `- tone: warmth ${f2(plan.warmthLevel)}, challenge ${f2(plan.challengeLevel)}, pacing ${plan.pacing}. ${plan.emotionalApproach}`,
     plan.hintLevel > 0 ? `- hint level: ${plan.hintLevel}% (100 = everything except the last step)` : '',
-    plan.useAnalogy ? `- use ONE analogy${plan.analogyDomain ? ` from: ${plan.analogyDomain}` : ''}; map it cleanly — do NOT force the phrase "So in the same way" every turn` : '- no forced analogy this turn',
+    plan.useAnalogy
+      ? `- use ONE analogy${plan.analogyDomain ? ` from: ${plan.analogyDomain}` : ''}; map it cleanly — do NOT force the phrase "So in the same way" every turn`
+      : '- no forced analogy this turn',
     askLine,
     teachLine,
-    plan.addressMisconception && plan.misconceptionCorrection ? `- gently correct this misconception: ${plan.misconceptionCorrection}` : '',
+    plan.addressMisconception && plan.misconceptionCorrection
+      ? `- gently correct this misconception: ${plan.misconceptionCorrection}`
+      : '',
     plan.connectToMemory ? `- weave in naturally: ${plan.connectToMemory}` : '',
     plan.mustInclude.length > 0 ? `- MUST include: ${plan.mustInclude.join('; ')}` : '',
     plan.mustAvoid.length > 0 ? `- MUST avoid: ${plan.mustAvoid.join('; ')}` : '',
     `- goal of this turn: ${plan.sessionGoal}`,
-  ].filter(Boolean).join('\n');
+  ]
+    .filter(Boolean)
+    .join('\n');
 
   const knownFacts = Object.entries(ctx.profile.facts || {})
     .slice(0, 12)
     .map(([k, v]) => `${k}=${v.factValue}`)
     .join('; ');
 
+  const boundaryLine =
+    ctx.boundaryDecision?.is_boundary
+      ? `Session boundary detected (${ctx.boundaryDecision.boundary_type}, p=${ctx.boundaryDecision.boundary_probability.toFixed(2)}). Re-establish pedagogical context gently; do not assume prior thread continuity.`
+      : '';
+
   const situation = [
     planBrief,
     '',
     knownFacts ? `Known facts about this student (use them — do not re-ask): ${knownFacts}` : '',
-    ctx.recalledEpisodes ? `Past moments you may reference:\n${ctx.recalledEpisodes}` : '',
+    ctx.cognitiveMemoryContext
+      ? `COGNITIVE MEMORY (activation-ranked + predictive):\n${ctx.cognitiveMemoryContext.slice(0, 1800)}`
+      : ctx.recalledEpisodes
+        ? `Past moments you may reference:\n${ctx.recalledEpisodes}`
+        : '',
+    ctx.palacePathHint ? `Memory palace path: ${ctx.palacePathHint}` : '',
+    boundaryLine,
     ctx.toolContext ? `Resources available:\n${ctx.toolContext.slice(0, 600)}` : '',
     ctx.subjectContext ? `STUDENT CONTEXT:\n${ctx.subjectContext}` : '',
+    ctx.dueReviews ? `Due for spaced review: ${ctx.dueReviews}` : '',
     `Recent conversation:\n${ctx.conversationHistory.slice(-1200) || 'This is the start of your relationship.'}`,
     '',
     `STUDENT'S MESSAGE: "${ctx.perception.rawMessage.slice(0, 800)}"`,
@@ -59,12 +77,23 @@ export async function generate(ctx: TurnContext, plan: TeachingPlan): Promise<LL
     plan.askQuestion
       ? 'Write your reply now — only the message text. At most one question at the end.'
       : 'Write your reply now — only the message text. ZERO questions. Teach or close warmly.',
-  ].filter(Boolean).join('\n');
+  ]
+    .filter(Boolean)
+    .join('\n');
 
-  const response = await routeAndCall([
-    { role: 'system', content: voicePrompt },
-    { role: 'user', content: situation },
-  ], { tier: 'smart', maxTokens: 900, temperature: 0.7, studentId: ctx.studentId, purpose: 'generation' });
+  const response = await routeAndCall(
+    [
+      { role: 'system', content: voicePrompt },
+      { role: 'user', content: situation },
+    ],
+    {
+      tier: 'smart',
+      maxTokens: 900,
+      temperature: 0.7,
+      studentId: ctx.studentId,
+      purpose: 'generation',
+    }
+  );
 
   if (!plan.askQuestion) {
     response.content = stripTrailingQuestions(response.content);
@@ -87,7 +116,12 @@ export function stripTrailingQuestions(text: string): string {
   const parts = out.split(/(?<=[.!])\s+|\n+/).filter(Boolean);
   while (parts.length > 1) {
     const last = parts[parts.length - 1].trim();
-    if (/\?$/.test(last) || /^(what|why|how|when|where|which|who|do you|did you|can you|could you|would you|are you)\b/i.test(last)) {
+    if (
+      /\?$/.test(last) ||
+      /^(what|why|how|when|where|which|who|do you|did you|can you|could you|would you|are you)\b/i.test(
+        last
+      )
+    ) {
       parts.pop();
       continue;
     }

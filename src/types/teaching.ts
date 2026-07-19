@@ -1,16 +1,24 @@
 /**
- * Teaching-engine types — the heart of v2.0.
+ * Teaching-engine types — the heart of v2.0 / v3.1 cognitive fusion.
  *
  * The v1 system scattered its "thinking" across 5-9 sequential LLM calls
  * (router, emotional agent, cultural agent, chain stages 1-3, pedagogy agent,
  * curriculum agent) that each saw a different slice of context. v2.0 fuses
  * this into a Perception -> Deliberation -> Generation pipeline where one
  * deliberation call sees everything and produces a TeachingPlan that drives
- * generation. This mirrors the Perception-Orchestration-Elicitation framework
- * from recent Socratic-tutor research and cuts per-turn latency/cost by ~60%.
+ * generation. v3.1 wires the seven cognitive breakthroughs into TurnContext
+ * so generation is conditioned on activation-ranked memory, predictive
+ * pre-load, palace paths, and tool-memory guidance.
  */
-import type { EmotionalSnapshot, SessionState, StudentProfile, WorkingMemorySnapshot, BloomLevel } from './student';
+import type {
+  EmotionalSnapshot,
+  SessionState,
+  StudentProfile,
+  WorkingMemorySnapshot,
+  BloomLevel,
+} from './student';
 import type { UsageSummary } from './llm';
+import type { BoundaryDecision, PreloadContext, MemoryChunk } from './cognitive';
 
 /** Output of the perception layer: one structured read of the student's message. */
 export interface PerceptionResult {
@@ -112,6 +120,16 @@ export interface TurnContext {
   causalInsight: string;
   toolContext: string;
   subjectContext: string;
+  /** v3.1: dual-process boundary decision for this turn (null if not evaluated). */
+  boundaryDecision?: BoundaryDecision | null;
+  /** v3.1: predictive pre-load cache hit (nightly / proactive). */
+  preloadContext?: PreloadContext | null;
+  /** v3.1: activation-ranked memory chunks (forgetting engine). */
+  activatedMemories?: MemoryChunk[];
+  /** v3.1: formatted cognitive memory block for generation. */
+  cognitiveMemoryContext?: string;
+  /** v3.1: memory palace path hint (Wing → Room → Drawer). */
+  palacePathHint?: string;
 }
 
 export interface TurnResult {
