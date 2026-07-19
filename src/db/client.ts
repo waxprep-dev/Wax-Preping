@@ -107,7 +107,7 @@ export async function initializeDatabase(): Promise<void> {
   await db.query(`
     CREATE TABLE IF NOT EXISTS student_archetypes (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      name TEXT NOT NULL,
+      name TEXT NOT NULL UNIQUE,
       description TEXT NOT NULL,
       centroid_vector VECTOR(1536),
       member_count INT NOT NULL DEFAULT 0,
@@ -259,11 +259,11 @@ export async function initializeDatabase(): Promise<void> {
       dedupe_key TEXT
     );
     ALTER TABLE notification_queue ADD COLUMN IF NOT EXISTS dedupe_key TEXT;
-    CREATE UNIQUE INDEX IF NOT EXISTS notif_dedupe_idx ON notification_queue(dedupe_key) WHERE dedupe_key IS NOT NULL;
-    CREATE INDEX IF NOT EXISTS notif_scheduled_idx ON notification_queue(scheduled_at, sent);
+    CREATE UNIQUE INDEX IF NOT EXISTS notif_dedupe_idx ON notification_queue(dedupe_key);
+    CREATE INDEX IF NOT EXISTS notif_student_idx ON notification_queue(student_id, sent, scheduled_at);
   `);
 
-  // Defense log (v2)
+  // Defense log (v2: content-safety layer)
   await db.query(`
     CREATE TABLE IF NOT EXISTS defense_log (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -399,7 +399,7 @@ export async function initializeDatabase(): Promise<void> {
     ALTER TABLE sessions ADD COLUMN IF NOT EXISTS previous_session_id TEXT REFERENCES sessions(session_id) ON DELETE SET NULL;
     ALTER TABLE sessions ADD COLUMN IF NOT EXISTS continuity_score FLOAT;
     ALTER TABLE sessions ADD COLUMN IF NOT EXISTS cognitive_metadata JSONB NOT NULL DEFAULT '{}';
-  `).catch(() => {});
+  `).catch(err => logger.warn({ err }, '[DB] Failed to extend sessions with cognitive fields'));
 
   // Extend conversation_turns with cognitive signals
   await db.query(`
@@ -407,7 +407,7 @@ export async function initializeDatabase(): Promise<void> {
     ALTER TABLE conversation_turns ADD COLUMN IF NOT EXISTS cognitive_load_estimate INT;
     ALTER TABLE conversation_turns ADD COLUMN IF NOT EXISTS topic_drift_score FLOAT;
     ALTER TABLE conversation_turns ADD COLUMN IF NOT EXISTS is_boundary_turn BOOLEAN DEFAULT FALSE;
-  `).catch(() => {});
+  `).catch(err => logger.warn({ err }, '[DB] Failed to extend conversation_turns with cognitive signals'));
 
   // Cognitive graph nodes
   await db.query(`
@@ -761,27 +761,32 @@ export async function initializeDatabase(): Promise<void> {
     ON CONFLICT (student_id) DO NOTHING;
   `);
 
-  // v3.0: Migrate existing student_facts into student_attributes
-  await db.query(`
-    INSERT INTO student_attributes (
-      student_id, attribute_key, attribute_value, confidence, 
-      evidence_json, category, is_active
-    )
-    SELECT 
-      student_id,
-      fact_key,
-      to_jsonb(fact_value),
-      COALESCE(confidence, 0.7),
-      jsonb_build_array(jsonb_build_object('source', COALESCE(source, 'migration'), 'timestamp', NOW())),
-      CASE 
-        WHEN fact_key IN ('intended_course', 'subject_interest', 'exam_type', 'target_school') THEN 'goal'
-        WHEN fact_key IN ('foundation_level', 'study_habit', 'track') THEN 'cognitive_preference'
-        ELSE 'contextual_factor'
-      END,
-      CASE WHEN COALESCE(confidence, 0.7) >= 0.6 THEN true ELSE false END
-    FROM student_facts
-    ON CONFLICT (student_id, attribute_key) DO NOTHING;
-  `).catch(() => {});
+  // v3.0: Migrate existing student_facts into student_attributes (only if data exists)
+  const factsCountRes = await db.query(`SELECT COUNT(*)::int AS count FROM student_facts`).catch(() => ({ rows: [{ count: 0 }] }));
+  const factsCount = factsCountRes.rows[0]?.count || 0;
+
+  if (factsCount > 0) {
+    await db.query(`
+      INSERT INTO student_attributes (
+        student_id, attribute_key, attribute_value, confidence, 
+        evidence_json, category, is_active
+      )
+      SELECT 
+        student_id,
+        fact_key,
+        to_jsonb(fact_value),
+        COALESCE(confidence, 0.7),
+        jsonb_build_array(jsonb_build_object('source', COALESCE(source, 'migration'), 'timestamp', NOW())),
+        CASE 
+          WHEN fact_key IN ('intended_course', 'subject_interest', 'exam_type', 'target_school') THEN 'goal'
+          WHEN fact_key IN ('foundation_level', 'study_habit', 'track') THEN 'cognitive_preference'
+          ELSE 'contextual_factor'
+        END,
+        CASE WHEN COALESCE(confidence, 0.7) >= 0.6 THEN true ELSE false END
+      FROM student_facts
+      ON CONFLICT (student_id, attribute_key) DO NOTHING;
+    `).catch(err => logger.warn({ err }, '[DB] Failed to migrate student_facts'));
+  }
 
   // Seed default archetypes and tools
   await seedDefaultArchetypes();
@@ -823,9 +828,9 @@ async function seedDefaultArchetypes(): Promise<void> {
     await db.query(
       `INSERT INTO student_archetypes (name, description, config, is_discovered)
        VALUES ($1, $2, $3, false)
-       ON CONFLICT DO NOTHING`,
+       ON CONFLICT (name) DO NOTHING`,
       [a.name, a.description, JSON.stringify(a.config)]
-    ).catch(() => {});
+    ).catch(err => logger.warn({ err }, `[DB] Failed to seed archetype ${a.name}`));
   }
 }
 
@@ -875,6 +880,6 @@ async function seedDefaultTools(): Promise<void> {
        VALUES ($1, $2, $3, $4, true)
        ON CONFLICT (name) DO NOTHING`,
       [t.name, t.description, JSON.stringify(t.input_schema), t.handler_module]
-    ).catch(() => {});
+    ).catch(err => logger.warn({ err }, `[DB] Failed to seed tool ${t.name}`));
   }
 }
