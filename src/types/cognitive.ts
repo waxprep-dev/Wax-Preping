@@ -178,6 +178,9 @@ export interface MemoryChunk {
   usage_count: number;
   feedback_score: number;
   decay_temperature: number;
+  
+  // Activation score (computed at retrieval time)
+  activation?: number;
 }
 
 export interface MemoryAccessLog {
