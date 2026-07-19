@@ -9,3 +9,4 @@ logs
 .DS_Store
 coverage
 *.tsbuildinfo
+package-lock.json
