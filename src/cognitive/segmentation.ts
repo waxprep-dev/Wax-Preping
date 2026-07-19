@@ -4,16 +4,11 @@
  * AI-driven boundary detector based on Kahneman's dual-process theory.
  */
 
-import { routeAndCall } from '../../llm/router';
-import { getSegmentationConfig } from '../../config/cognitive';
-import { logger } from '../../middleware/logger';
-import { db } from '../../db/client';
-import type {
-  BoundaryDecision,
-  BoundarySignal,
-  SegmentationConfig,
-  SessionBoundaryRecord,
-} from '../../types/cognitive';
+import { routeAndCall } from '../llm/router';
+import { getSegmentationConfig } from '../config/cognitive';
+import { logger } from '../middleware/logger';
+import { db } from '../db/client';
+import type { BoundaryDecision, BoundarySignal, SegmentationConfig, SessionBoundaryRecord } from '../types/cognitive';
 import { computeBoundarySignals } from './boundary_signals';
 
 /**
