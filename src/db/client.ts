@@ -746,7 +746,7 @@ export async function initializeDatabase(): Promise<void> {
     ('prediction', '{"enabled": true, "preload_ttl_seconds": 21600, "prediction_horizon_days": 7}', 'Predictive pre-load settings'),
     ('palace', '{"enabled": true, "auto_construct": true, "max_wings": 20, "max_rooms_per_wing": 50}', 'Memory palace settings'),
     ('tool_memory', '{"enabled": true, "learn_from_failures": true, "dependency_tracking": true}', 'Tool-memory symbiosis settings'),
-    ('sleep_mode', '{"enabled": true, "schedule_cron": "0 2 * * *", "timezone_aware": true, "max_students_per_night": 100}', 'Sleep mode consolidation settings'),
+    ('sleep_mode', '{"enabled": true, "schedule_cron": "0 2 * * *", "tick_cron": "*/15 * * * *", "local_hour": 2, "timezone_aware": true, "max_students_per_night": 100, "min_hours_between_runs": 20, "lookback_days": 7, "batch_size": 5}', 'Timezone-aware sleep mode consolidation settings'),
     ('graph', '{"adapter": "postgres", "neo4j_uri": null, "neo4j_user": null, "embedding_dimension": 384}', 'Graph database adapter configuration')
     ON CONFLICT (key) DO NOTHING;
   `);
@@ -859,7 +859,7 @@ async function seedDefaultTools(): Promise<void> {
     },
     {
       name: 'code_interpreter',
-      description: 'Run Python code for simulations, visualizations, and algorithmic explanations.',
+      description: 'Execute Python or JavaScript in a short-lived isolated subprocess (timeout + security scan).',,
       input_schema: { type: 'object', properties: { code: { type: 'string' }, language: { type: 'string', default: 'python' } }, required: ['code'] },
       handler_module: 'src/tools/implementations.ts',
     },

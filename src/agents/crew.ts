@@ -60,6 +60,7 @@ import {
 import { getArchetypePromptModifier, matchArchetypes } from '../student_profile/archetypes';
 import { decideNextTopic, getRecentErrors } from '../navigation/ai_navigator';
 import { searchSyllabus, formatSyllabusContext } from '../syllabus/store';
+import { ensureSyllabusCoverage } from '../syllabus/auto_ingest';
 import { retrieveMemories } from '../forgetting/engine';
 import { checkPreloadCache, predictivePreLoad } from '../predictive/engine';
 import { selectTools } from '../tool_memory/dtdr';
@@ -416,6 +417,19 @@ export async function processTutorMessage(input: ProcessMessageInput): Promise<s
       return [];
     });
     syllabusContext = formatSyllabusContext(syllabusResults);
+
+    // Demand-driven auto-ingest when store is thin (never blocks the reply path)
+    if (syllabusResults.length < 2) {
+      setImmediate(() => {
+        ensureSyllabusCoverage({
+          subject: currentSubject !== 'general' ? currentSubject : undefined,
+          examBoard: profile.culturalContext.examBoards?.[0],
+          topic: currentConcept || undefined,
+          minChunks: 3,
+          studentId,
+        }).catch(err => logger.debug({ err }, '[Crew] ensureSyllabusCoverage failed'));
+      });
+    }
   }
 
   const recalledText =
