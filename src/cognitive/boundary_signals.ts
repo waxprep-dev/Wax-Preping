@@ -4,9 +4,9 @@
  * Subject-agnostic: works for any topic, any subject.
  */
 
-import { embed } from '../../memory/embeddings';
-import { logger } from '../../middleware/logger';
-import type { BoundarySignal, SegmentationConfig } from '../../types/cognitive';
+import { embed } from '../memory/embeddings';
+import { logger } from '../middleware/logger';
+import type { BoundarySignal, SegmentationConfig } from '../types/cognitive';
 
 /**
  * Compute all boundary signals for a message pair.
