@@ -31,7 +31,6 @@ export class Neo4jGraphAdapter implements GraphAdapter {
 
   async connect(): Promise<void> {
     try {
-      // Dynamic import — neo4j-driver is an optional runtime dependency
       const neo4j = await import('neo4j-driver').catch((err) => {
         logger.error({ err }, '[Neo4jGraph] Failed to load neo4j-driver');
         throw new Error(
@@ -241,18 +240,63 @@ export class Neo4jGraphAdapter implements GraphAdapter {
     }
   }
 
-  async traverse(options: TraversalOptions): Promise<GraphPath[]> {
+  async updateEdge(id: string, updates: Partial<GraphEdge>): Promise<GraphEdge> {
     if (!this.driver) throw new Error('Neo4j not connected');
     const session = (this.driver as { session: () => unknown }).session();
     try {
-      const typeFilter = options.edgeType ? `:${options.edgeType}` : '';
+      const result = await (session as { run: (q: string, p: Record<string, unknown>) => Promise<{ records: Array<{ get: (k: string) => unknown }> }> }).run(
+        `MATCH ()-[r]->() WHERE r._id = $id SET r += $props RETURN r, startNode(r).id as source_id, endNode(r).id as target_id`,
+        { id, props: updates.properties || {} }
+      );
+      const record = result.records[0];
+      return this.mapNeo4jEdge(
+        record.get('r') as Record<string, unknown>,
+        record.get('source_id') as string,
+        record.get('target_id') as string
+      );
+    } finally {
+      await (session as { close: () => Promise<void> }).close();
+    }
+  }
+
+  async invalidateEdge(id: string, _reason?: string): Promise<void> {
+    if (!this.driver) throw new Error('Neo4j not connected');
+    const session = (this.driver as { session: () => unknown }).session();
+    try {
+      await (session as { run: (q: string, p: Record<string, unknown>) => Promise<unknown> }).run(
+        `MATCH ()-[r]->() WHERE r._id = $id SET r._valid = false`,
+        { id }
+      );
+    } finally {
+      await (session as { close: () => Promise<void> }).close();
+    }
+  }
+
+  async deleteEdge(id: string): Promise<void> {
+    if (!this.driver) throw new Error('Neo4j not connected');
+    const session = (this.driver as { session: () => unknown }).session();
+    try {
+      await (session as { run: (q: string, p: Record<string, unknown>) => Promise<unknown> }).run(
+        `MATCH ()-[r]->() WHERE r._id = $id DELETE r`,
+        { id }
+      );
+    } finally {
+      await (session as { close: () => Promise<void> }).close();
+    }
+  }
+
+  async traverse(startNodeId: string, options: TraversalOptions): Promise<GraphPath[]> {
+    if (!this.driver) throw new Error('Neo4j not connected');
+    const session = (this.driver as { session: () => unknown }).session();
+    try {
+      const typeFilter = options.edgeTypes && options.edgeTypes.length > 0 ? `:${options.edgeTypes.join('|')}` : '';
       const maxDepth = options.maxDepth || 3;
       const result = await (session as { run: (q: string, p: Record<string, unknown>) => Promise<{ records: Array<{ get: (k: string) => unknown }> }> }).run(
         `MATCH path = (start)-[r${typeFilter}*1..${maxDepth}]-(end)
          WHERE start.id = $startNodeId
          RETURN path
          LIMIT $limit`,
-        { startNodeId: options.startNodeId, limit: options.limit || 50 }
+        { startNodeId, limit: options.limit || 50 }
       );
       return result.records.map(r => {
         const path = r.get('path') as Record<string, unknown>;
@@ -263,7 +307,25 @@ export class Neo4jGraphAdapter implements GraphAdapter {
     }
   }
 
-  async similaritySearch(options: SimilaritySearchOptions): Promise<GraphNode[]> {
+  async shortestPath(startNodeId: string, endNodeId: string, edgeTypes?: string[]): Promise<GraphPath | null> {
+    if (!this.driver) throw new Error('Neo4j not connected');
+    const session = (this.driver as { session: () => unknown }).session();
+    try {
+      const typeFilter = edgeTypes && edgeTypes.length > 0 ? `:${edgeTypes.join('|')}` : '';
+      const result = await (session as { run: (q: string, p: Record<string, unknown>) => Promise<{ records: Array<{ get: (k: string) => unknown }> }> }).run(
+        `MATCH path = shortestPath((a)-[r${typeFilter}*]-(b))
+         WHERE a.id = $startNodeId AND b.id = $endNodeId
+         RETURN path`,
+        { startNodeId, endNodeId }
+      );
+      if (result.records.length === 0) return null;
+      return this.mapNeo4jPath(result.records[0].get('path') as Record<string, unknown>);
+    } finally {
+      await (session as { close: () => Promise<void> }).close();
+    }
+  }
+
+  async findSimilar(options: SimilaritySearchOptions): Promise<GraphNode[]> {
     if (!this.driver) throw new Error('Neo4j not connected');
     const session = (this.driver as { session: () => unknown }).session();
     try {
@@ -279,21 +341,30 @@ export class Neo4jGraphAdapter implements GraphAdapter {
     }
   }
 
-  async biTemporalQuery(options: BiTemporalQueryOptions): Promise<GraphNode[]> {
+  async queryBiTemporal(options: BiTemporalQueryOptions): Promise<GraphNode[]> {
     if (!this.driver) throw new Error('Neo4j not connected');
     const session = (this.driver as { session: () => unknown }).session();
     try {
       const result = await (session as { run: (q: string, p: Record<string, unknown>) => Promise<{ records: Array<{ get: (k: string) => unknown }> }> }).run(
-        `MATCH (n)
-         WHERE n._event_time >= $start AND n._event_time <= $end
+        `MATCH (n:${options.nodeLabel})
+         WHERE n._student_id = $studentId
+         AND n._event_time <= $atTime
          RETURN n
          LIMIT $limit`,
-        { start: options.startTime.toISOString(), end: options.endTime.toISOString(), limit: options.limit || 50 }
+        { studentId: options.studentId, atTime: options.atTime.toISOString(), limit: 50 }
       );
       return result.records.map(r => this.mapNeo4jNode(r.get('n') as Record<string, unknown>));
     } finally {
       await (session as { close: () => Promise<void> }).close();
     }
+  }
+
+  async executeBatch<T>(operations: Array<() => Promise<T>>): Promise<T[]> {
+    const results: T[] = [];
+    for (const op of operations) {
+      results.push(await op());
+    }
+    return results;
   }
 
   private mapNeo4jNode(record: Record<string, unknown>): GraphNode {
@@ -305,7 +376,8 @@ export class Neo4jGraphAdapter implements GraphAdapter {
       embedding: props._embedding as number[] | undefined,
       student_id: props._student_id as string | undefined,
       source: props._source as string | undefined,
-      event_time: props._event_time ? new Date(props._event_time as string) : undefined,
+      event_time: props._event_time ? new Date(props._event_time as string) : new Date(),
+      ingest_time: new Date(),
       created_at: new Date(),
     };
   }
@@ -319,7 +391,8 @@ export class Neo4jGraphAdapter implements GraphAdapter {
       type: (props.type as string) || 'RELATED_TO',
       properties: props,
       student_id: props._student_id as string | undefined,
-      event_time: props._event_time ? new Date(props._event_time as string) : undefined,
+      event_time: props._event_time ? new Date(props._event_time as string) : new Date(),
+      ingest_time: new Date(),
       created_at: new Date(),
     };
   }
