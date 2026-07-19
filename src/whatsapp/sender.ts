@@ -21,7 +21,7 @@ export async function sendTextMessage(phoneNumberId: string, to: string, text: s
       lastId = response.data?.messages?.[0]?.id ?? '';
       if (i < chunks.length - 1) await new Promise(r => setTimeout(r, 1200));
     } catch (err) {
-      logger.error('[Sender] Send failed:');
+      logger.error({ err }, '[Sender] Send failed');
     }
   }
 
@@ -39,8 +39,9 @@ export async function markAsRead(phoneNumberId: string, messageId: string): Prom
 }
 
 /**
- * Send a typing indicator to the student.
- * Use this before long operations (tool calls, LLM calls) to signal activity.
+ * Send an activity indicator to the student.
+ * Note: WhatsApp Cloud API does not support native typing indicators.
+ * This sends a placeholder text as a best-effort activity signal.
  */
 export async function sendTypingIndicator(phoneNumberId: string, to: string): Promise<void> {
   try {
@@ -56,7 +57,7 @@ export async function sendTypingIndicator(phoneNumberId: string, to: string): Pr
       { headers: headers(), timeout: 5_000 }
     );
   } catch {
-    // Typing indicators are best-effort; failures are non-critical
+    // Activity indicators are best-effort; failures are non-critical
   }
 }
 
