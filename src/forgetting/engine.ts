@@ -126,6 +126,7 @@ function graphNodeToMemoryChunk(node: GraphNode, params: ForgettingParams): Memo
     usage_count: (props.usage_count as number) || 1,
     feedback_score: (props.feedback_score as number) || 0,
     decay_temperature: params.decay_temperature,
+    activation: 0,
   };
 }
 
