@@ -6,14 +6,14 @@
  * new cognitive architecture (attributes, archetypes, syllabus, tools).
  */
 import 'dotenv/config';
-import express, { Request, Response } from 'express';
+import express, { Request, Response, NextFunction } from 'express';
 import { initializeDatabase } from './db/client';
 import { createWebhookRouter } from './whatsapp/webhook';
 import { logger } from './middleware/logger';
 import { db } from './db/client';
 import { searchSyllabus, getAvailableSubjects, getTopicsForSubject } from './syllabus/store';
 import { ingestSyllabusDirectory } from './syllabus/ingest';
-import { getActiveAttributes, getPromptGradeAttributes } from './student_profile/attribute_pipeline';
+import { getActiveAttributes } from './student_profile/attribute_pipeline';
 import { matchArchetypes, warmStartFromArchetype } from './student_profile/archetypes';
 import { getOnboardingState } from './onboarding/engine';
 import { executeToolByName } from './tools/implementations';
@@ -31,8 +31,21 @@ import { startSleepScheduler } from './sleep/scheduler';
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+/**
+ * Admin authentication middleware.
+ * Requires X-Admin-Key header or admin_key query param matching ADMIN_KEY env var.
+ */
+function requireAdmin(req: Request, res: Response, next: NextFunction): void {
+  const key = req.headers['x-admin-key'] || req.query.admin_key;
+  if (!process.env.ADMIN_KEY || key !== process.env.ADMIN_KEY) {
+    res.status(401).json({ error: 'Unauthorized' });
+    return;
+  }
+  next();
+}
+
 // Capture raw body for Meta signature verification BEFORE express.json() parses
-app.use((req: Request, res, next) => {
+app.use((req: Request, res: Response, next: NextFunction) => {
   let data = '';
   req.setEncoding('utf8');
   req.on('data', chunk => { data += chunk; });
@@ -43,11 +56,14 @@ app.use((req: Request, res, next) => {
 });
 
 app.use(express.json());
-// logger is pino, not Express middleware — request logging handled by Railway
 
 app.get('/health', (_req: Request, res: Response) => {
   res.status(200).json({ status: 'ok', version: '3.0.0-cognitive' });
 });
+
+// ── Admin Routes ─────────────────────────────────────────────────────────
+// All /admin routes require authentication
+app.use('/admin', requireAdmin);
 
 // ── Admin Routes: Student Profile ────────────────────────────────────────
 
@@ -56,6 +72,7 @@ app.get('/admin/students/:studentId/attributes', async (req: Request, res: Respo
     const attrs = await getActiveAttributes(req.params.studentId);
     res.json({ studentId: req.params.studentId, attributes: attrs });
   } catch (err) {
+    logger.error({ err }, '[Admin] Failed to fetch attributes');
     res.status(500).json({ error: 'Failed to fetch attributes' });
   }
 });
@@ -72,6 +89,7 @@ app.get('/admin/students/:studentId/archetypes', async (req: Request, res: Respo
     );
     res.json({ studentId: req.params.studentId, archetypes: result.rows });
   } catch (err) {
+    logger.error({ err }, '[Admin] Failed to fetch archetypes');
     res.status(500).json({ error: 'Failed to fetch archetypes' });
   }
 });
@@ -81,6 +99,7 @@ app.post('/admin/students/:studentId/archetypes/refresh', async (req: Request, r
     const matches = await matchArchetypes(req.params.studentId);
     res.json({ studentId: req.params.studentId, matches });
   } catch (err) {
+    logger.error({ err }, '[Admin] Failed to refresh archetypes');
     res.status(500).json({ error: 'Failed to refresh archetypes' });
   }
 });
@@ -90,6 +109,7 @@ app.post('/admin/students/:studentId/archetypes/warm-start', async (req: Request
     await warmStartFromArchetype(req.params.studentId);
     res.json({ studentId: req.params.studentId, status: 'warm-started' });
   } catch (err) {
+    logger.error({ err }, '[Admin] Failed to warm-start');
     res.status(500).json({ error: 'Failed to warm-start' });
   }
 });
@@ -99,6 +119,7 @@ app.get('/admin/students/:studentId/onboarding', async (req: Request, res: Respo
     const state = await getOnboardingState(req.params.studentId);
     res.json({ studentId: req.params.studentId, onboarding: state });
   } catch (err) {
+    logger.error({ err }, '[Admin] Failed to fetch onboarding state');
     res.status(500).json({ error: 'Failed to fetch onboarding state' });
   }
 });
@@ -118,6 +139,7 @@ app.get('/admin/syllabus/search', async (req: Request, res: Response) => {
     });
     res.json({ query: String(query), results });
   } catch (err) {
+    logger.error({ err }, '[Admin] Syllabus search failed');
     res.status(500).json({ error: 'Syllabus search failed' });
   }
 });
@@ -127,6 +149,7 @@ app.get('/admin/syllabus/subjects', async (_req: Request, res: Response) => {
     const subjects = await getAvailableSubjects();
     res.json({ subjects });
   } catch (err) {
+    logger.error({ err }, '[Admin] Failed to fetch subjects');
     res.status(500).json({ error: 'Failed to fetch subjects' });
   }
 });
@@ -136,6 +159,7 @@ app.get('/admin/syllabus/subjects/:subject/topics', async (req: Request, res: Re
     const topics = await getTopicsForSubject(req.params.subject, req.query.exam_board as string | undefined);
     res.json({ subject: req.params.subject, topics });
   } catch (err) {
+    logger.error({ err }, '[Admin] Failed to fetch topics');
     res.status(500).json({ error: 'Failed to fetch topics' });
   }
 });
@@ -147,9 +171,15 @@ app.post('/admin/syllabus/ingest', async (req: Request, res: Response) => {
       res.status(400).json({ error: 'directory path required' });
       return;
     }
+    // Prevent directory traversal attacks
+    if (directory.includes('..') || directory.startsWith('/')) {
+      res.status(400).json({ error: 'Invalid directory path' });
+      return;
+    }
     const result = await ingestSyllabusDirectory(directory);
     res.json({ directory, ...result });
   } catch (err) {
+    logger.error({ err }, '[Admin] Ingestion failed');
     res.status(500).json({ error: 'Ingestion failed' });
   }
 });
@@ -161,6 +191,7 @@ app.get('/admin/tools', async (_req: Request, res: Response) => {
     const result = await db.query(`SELECT name, description, is_enabled, input_schema FROM tools ORDER BY name`);
     res.json({ tools: result.rows });
   } catch (err) {
+    logger.error({ err }, '[Admin] Failed to fetch tools');
     res.status(500).json({ error: 'Failed to fetch tools' });
   }
 });
@@ -171,6 +202,7 @@ app.post('/admin/tools/:toolName/toggle', async (req: Request, res: Response) =>
     await db.query(`UPDATE tools SET is_enabled = $1, updated_at = NOW() WHERE name = $2`, [enabled === true, req.params.toolName]);
     res.json({ tool: req.params.toolName, enabled: enabled === true });
   } catch (err) {
+    logger.error({ err }, '[Admin] Failed to toggle tool');
     res.status(500).json({ error: 'Failed to toggle tool' });
   }
 });
@@ -178,9 +210,14 @@ app.post('/admin/tools/:toolName/toggle', async (req: Request, res: Response) =>
 app.post('/admin/tools/:toolName/invoke', async (req: Request, res: Response) => {
   try {
     const { studentId, params } = req.body;
+    if (!req.params.toolName || typeof req.params.toolName !== 'string') {
+      res.status(400).json({ error: 'Tool name required' });
+      return;
+    }
     const result = await executeToolByName(req.params.toolName, params || {}, studentId || 'admin');
     res.json({ tool: req.params.toolName, result });
   } catch (err) {
+    logger.error({ err }, '[Admin] Tool invocation failed');
     res.status(500).json({ error: 'Tool invocation failed' });
   }
 });
@@ -201,6 +238,7 @@ app.get('/admin/observability/attribute-extraction', async (req: Request, res: R
     const result = await db.query(query, params);
     res.json({ logs: result.rows });
   } catch (err) {
+    logger.error({ err }, '[Admin] Failed to fetch attribute extraction logs');
     res.status(500).json({ error: 'Failed to fetch logs' });
   }
 });
@@ -225,6 +263,7 @@ app.get('/admin/observability/tool-calls', async (req: Request, res: Response) =
     const result = await db.query(query, params);
     res.json({ logs: result.rows });
   } catch (err) {
+    logger.error({ err }, '[Admin] Failed to fetch tool call logs');
     res.status(500).json({ error: 'Failed to fetch logs' });
   }
 });
@@ -243,6 +282,7 @@ app.get('/admin/observability/decisions', async (req: Request, res: Response) =>
     const result = await db.query(query, params);
     res.json({ logs: result.rows });
   } catch (err) {
+    logger.error({ err }, '[Admin] Failed to fetch decision logs');
     res.status(500).json({ error: 'Failed to fetch logs' });
   }
 });
@@ -253,8 +293,9 @@ app.get('/admin/observability/decisions', async (req: Request, res: Response) =>
 app.post('/admin/cognitive/migrate-graph', async (_req: Request, res: Response) => {
   try {
     const result = await migrateExistingDataToGraph();
-    res.json({ status: 'migration_complete', ...result });
+    res.json({ status: 'migrated', result });
   } catch (err) {
+    logger.error({ err }, '[Admin] Graph migration failed');
     res.status(500).json({ error: 'Graph migration failed' });
   }
 });
@@ -266,6 +307,7 @@ app.get('/admin/cognitive/graph-health', async (_req: Request, res: Response) =>
     const healthy = await graph.healthCheck();
     res.json({ adapter: graph.name, healthy });
   } catch (err) {
+    logger.error({ err }, '[Admin] Graph health check failed');
     res.status(500).json({ error: 'Graph health check failed' });
   }
 });
@@ -276,6 +318,7 @@ app.get('/admin/cognitive/segmentation-config/:studentId?', async (req: Request,
     const config = await getSegmentationConfig(req.params.studentId);
     res.json(config);
   } catch (err) {
+    logger.error({ err }, '[Admin] Failed to fetch segmentation config');
     res.status(500).json({ error: 'Failed to fetch segmentation config' });
   }
 });
@@ -288,6 +331,7 @@ app.post('/admin/cognitive/segmentation-config/:studentId?', async (req: Request
     }
     res.json({ status: 'updated' });
   } catch (err) {
+    logger.error({ err }, '[Admin] Failed to update segmentation config');
     res.status(500).json({ error: 'Failed to update segmentation config' });
   }
 });
@@ -307,6 +351,7 @@ app.post('/admin/cognitive/evaluate-boundary', async (req: Request, res: Respons
     );
     res.json(decision);
   } catch (err) {
+    logger.error({ err }, '[Admin] Boundary evaluation failed');
     res.status(500).json({ error: 'Boundary evaluation failed' });
   }
 });
@@ -317,6 +362,7 @@ app.get('/admin/cognitive/boundaries/:studentId', async (req: Request, res: Resp
     const boundaries = await getRecentBoundaries(req.params.studentId, parseInt(req.query.limit as string || '10', 10));
     res.json({ studentId: req.params.studentId, boundaries });
   } catch (err) {
+    logger.error({ err }, '[Admin] Failed to fetch boundaries');
     res.status(500).json({ error: 'Failed to fetch boundaries' });
   }
 });
@@ -328,6 +374,7 @@ app.post('/admin/cognitive/boundary-feedback/:boundaryId', async (req: Request, 
     await provideBoundaryFeedback(req.params.boundaryId, wasCorrect === true);
     res.json({ boundaryId: req.params.boundaryId, feedback: wasCorrect });
   } catch (err) {
+    logger.error({ err }, '[Admin] Failed to record feedback');
     res.status(500).json({ error: 'Failed to record feedback' });
   }
 });
@@ -338,6 +385,7 @@ app.get('/admin/cognitive/forgetting-params/:studentId', async (req: Request, re
     const params = await getForgettingParams(req.params.studentId);
     res.json(params);
   } catch (err) {
+    logger.error({ err }, '[Admin] Failed to fetch forgetting params');
     res.status(500).json({ error: 'Failed to fetch forgetting params' });
   }
 });
@@ -347,6 +395,7 @@ app.post('/admin/cognitive/forgetting-params/:studentId', async (req: Request, r
     await updateForgettingParams(req.params.studentId, req.body);
     res.json({ status: 'updated' });
   } catch (err) {
+    logger.error({ err }, '[Admin] Failed to update forgetting params');
     res.status(500).json({ error: 'Failed to update forgetting params' });
   }
 });
@@ -358,6 +407,7 @@ app.post('/admin/cognitive/retrieve-memories', async (req: Request, res: Respons
     const memories = await retrieveMemories(query, studentId, workingMemoryContext || '', { limit });
     res.json({ studentId, query, memories });
   } catch (err) {
+    logger.error({ err }, '[Admin] Memory retrieval failed');
     res.status(500).json({ error: 'Memory retrieval failed' });
   }
 });
@@ -368,6 +418,7 @@ app.post('/admin/cognitive/preload/:studentId', async (req: Request, res: Respon
     const context = await predictivePreLoad(req.params.studentId);
     res.json({ studentId: req.params.studentId, context });
   } catch (err) {
+    logger.error({ err }, '[Admin] Pre-load failed');
     res.status(500).json({ error: 'Pre-load failed' });
   }
 });
@@ -377,6 +428,7 @@ app.get('/admin/cognitive/preload/:studentId', async (req: Request, res: Respons
     const context = await checkPreloadCache(req.params.studentId);
     res.json({ studentId: req.params.studentId, context });
   } catch (err) {
+    logger.error({ err }, '[Admin] Failed to check preload');
     res.status(500).json({ error: 'Failed to check preload' });
   }
 });
@@ -389,6 +441,7 @@ app.get('/admin/cognitive/palace/:studentId', async (req: Request, res: Response
     const stats = await getPalaceStats(req.params.studentId);
     res.json({ palace, hierarchy, stats });
   } catch (err) {
+    logger.error({ err }, '[Admin] Failed to fetch palace');
     res.status(500).json({ error: 'Failed to fetch palace' });
   }
 });
@@ -398,6 +451,7 @@ app.post('/admin/cognitive/palace/:studentId/discover-tunnels', async (req: Requ
     const tunnels = await discoverTunnels(req.params.studentId);
     res.json({ studentId: req.params.studentId, tunnels });
   } catch (err) {
+    logger.error({ err }, '[Admin] Tunnel discovery failed');
     res.status(500).json({ error: 'Tunnel discovery failed' });
   }
 });
@@ -408,6 +462,7 @@ app.post('/admin/cognitive/sleep-mode/:studentId', async (req: Request, res: Res
     const result = await runSleepMode(req.params.studentId);
     res.json({ studentId: req.params.studentId, result });
   } catch (err) {
+    logger.error({ err }, '[Admin] Sleep mode failed');
     res.status(500).json({ error: 'Sleep mode failed' });
   }
 });
@@ -418,6 +473,7 @@ app.get('/admin/cognitive/config/:key', async (req: Request, res: Response) => {
     const config = await getCognitiveConfig(req.params.key as any);
     res.json({ key: req.params.key, config });
   } catch (err) {
+    logger.error({ err }, '[Admin] Failed to fetch config');
     res.status(500).json({ error: 'Failed to fetch config' });
   }
 });
@@ -427,6 +483,7 @@ app.post('/admin/cognitive/config/:key', async (req: Request, res: Response) => 
     await setCognitiveConfig(req.params.key as any, req.body);
     res.json({ status: 'updated', key: req.params.key });
   } catch (err) {
+    logger.error({ err }, '[Admin] Failed to update config');
     res.status(500).json({ error: 'Failed to update config' });
   }
 });
