@@ -198,23 +198,38 @@ async function handleCodeInterpreter(
   params: Record<string, unknown>,
   _studentId: string
 ): Promise<ToolResult> {
-  const code = String(params.code || '');
+  const code = String(params.code || params.expression || params.query || '');
   const language = String(params.language || 'python');
 
-  // Intentionally not a sandboxed executor yet — returns structured guidance
-  // so the tutor can still reason about the code without a static bank.
+  if (!code.trim()) {
+    return {
+      success: false,
+      output: 'code_interpreter requires a `code` string.',
+      error: 'missing_code',
+      latencyMs: 0,
+    };
+  }
+
+  const { runSandboxedCode, formatCodeRunForTutor } = await import('./sandbox');
+  const run = await runSandboxedCode(code, language);
+  const output = formatCodeRunForTutor(run);
+
   return {
-    success: true,
-    output: [
-      `Code interpreter received ${language} snippet (${code.length} chars).`,
-      'Sandbox execution is not enabled in this environment.',
-      'Provide a step-by-step dry-run of the algorithm and expected outputs instead.',
-      code ? `Snippet preview:\n${code.slice(0, 400)}` : '',
-    ]
-      .filter(Boolean)
-      .join('\n'),
-    data: { code, language, status: 'dry_run_only' },
-    latencyMs: 0,
+    success: run.success,
+    output,
+    data: {
+      code: code.slice(0, 2000),
+      language: run.language,
+      status: run.blocked ? 'blocked' : run.timedOut ? 'timeout' : run.success ? 'ok' : 'error',
+      stdout: run.stdout,
+      stderr: run.stderr,
+      exitCode: run.exitCode,
+      durationMs: run.durationMs,
+      blocked: run.blocked,
+      blockReason: run.blockReason,
+    },
+    error: run.success ? undefined : run.stderr || run.blockReason || 'execution_failed',
+    latencyMs: run.durationMs,
   };
 }
 

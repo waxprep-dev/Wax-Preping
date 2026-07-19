@@ -13,6 +13,7 @@ import { logger } from './middleware/logger';
 import { db } from './db/client';
 import { searchSyllabus, getAvailableSubjects, getTopicsForSubject } from './syllabus/store';
 import { ingestSyllabusDirectory } from './syllabus/ingest';
+import { autoIngestSyllabus, ingestFromUrl, ensureIngestSchema } from './syllabus/auto_ingest';
 import { getActiveAttributes } from './student_profile/attribute_pipeline';
 import { matchArchetypes, warmStartFromArchetype } from './student_profile/archetypes';
 import { getOnboardingState } from './onboarding/engine';
@@ -26,7 +27,7 @@ import { predictivePreLoad, checkPreloadCache } from './predictive/engine';
 import { ensurePalace, discoverTunnels } from './palace/organizer';
 import { getPalaceHierarchy, getPalaceStats } from './palace/hierarchy';
 import { runSleepMode } from './sleep/pipeline';
-import { startSleepScheduler } from './sleep/scheduler';
+import { startSleepScheduler, runTimezoneAwareTick, previewSleepCandidates, runNightlyConsolidation } from './sleep/scheduler';
 import { checkRateLimit } from './middleware/rate_limiter';
 
 const app = express();
@@ -201,6 +202,54 @@ app.post('/admin/syllabus/ingest', async (req: Request, res: Response) => {
     res.status(500).json({ error: 'Ingestion failed' });
   }
 });
+
+// Automatic syllabus discovery (no manual PDF upload required)
+app.post('/admin/syllabus/auto-ingest', async (req: Request, res: Response) => {
+  try {
+    const { subject, examBoard, level, queryHint, maxSources, force, url } = req.body || {};
+    if (url && typeof url === 'string') {
+      const result = await ingestFromUrl(url, {
+        subject: typeof subject === 'string' ? subject : undefined,
+        examBoard: typeof examBoard === 'string' ? examBoard : undefined,
+        level: typeof level === 'string' ? level : undefined,
+        force: force === true,
+      });
+      res.json(result);
+      return;
+    }
+    const result = await autoIngestSyllabus({
+      subject: typeof subject === 'string' ? subject : undefined,
+      examBoard: typeof examBoard === 'string' ? examBoard : undefined,
+      level: typeof level === 'string' ? level : undefined,
+      queryHint: typeof queryHint === 'string' ? queryHint : undefined,
+      maxSources: typeof maxSources === 'number' ? maxSources : undefined,
+      force: force === true,
+    });
+    res.json(result);
+  } catch (err) {
+    logger.error({ err }, '[Admin] Auto-ingest failed');
+    res.status(500).json({ error: 'Auto-ingest failed' });
+  }
+});
+
+app.get('/admin/syllabus/ingest-runs', async (req: Request, res: Response) => {
+  try {
+    await ensureIngestSchema();
+    const limit = Math.min(100, Math.max(1, Number(req.query.limit) || 20));
+    const result = await db.query(
+      `SELECT id, source_url, subject, exam_board, status, chunks_inserted, error_message, started_at, completed_at
+       FROM syllabus_ingest_runs
+       ORDER BY started_at DESC
+       LIMIT $1`,
+      [limit]
+    );
+    res.json({ runs: result.rows });
+  } catch (err) {
+    logger.error({ err }, '[Admin] Failed to list ingest runs');
+    res.status(500).json({ error: 'Failed to list ingest runs' });
+  }
+});
+
 
 // ── Admin Routes: Tools ──────────────────────────────────────────────────
 
@@ -485,6 +534,39 @@ app.post('/admin/cognitive/sleep-mode/:studentId', async (req: Request, res: Res
   }
 });
 
+app.post('/admin/cognitive/sleep-mode/tick', async (_req: Request, res: Response) => {
+  try {
+    const result = await runTimezoneAwareTick();
+    res.json(result);
+  } catch (err) {
+    logger.error({ err }, '[Admin] Sleep tick failed');
+    res.status(500).json({ error: 'Sleep tick failed' });
+  }
+});
+
+app.get('/admin/cognitive/sleep-mode/preview', async (req: Request, res: Response) => {
+  try {
+    const limit = Math.min(200, Math.max(1, Number(req.query.limit) || 50));
+    const candidates = await previewSleepCandidates(limit);
+    res.json({ candidates });
+  } catch (err) {
+    logger.error({ err }, '[Admin] Sleep preview failed');
+    res.status(500).json({ error: 'Sleep preview failed' });
+  }
+});
+
+app.post('/admin/cognitive/sleep-mode/bulk', async (req: Request, res: Response) => {
+  try {
+    const maxStudents = Math.min(500, Math.max(1, Number(req.body?.maxStudents) || 50));
+    await runNightlyConsolidation(maxStudents);
+    res.json({ ok: true, maxStudents });
+  } catch (err) {
+    logger.error({ err }, '[Admin] Sleep bulk failed');
+    res.status(500).json({ error: 'Sleep bulk failed' });
+  }
+});
+
+
 // Cognitive system config
 app.get('/admin/cognitive/config/:key', async (req: Request, res: Response) => {
   try {
@@ -514,12 +596,15 @@ app.use('/whatsapp', createWebhookRouter());
 
 async function main() {
   await initializeDatabase();
-  
-  // Start sleep mode scheduler in background
+  await ensureIngestSchema().catch(err =>
+    logger.warn({ err }, '[Startup] syllabus ingest schema failed')
+  );
+
+  // Start timezone-aware sleep mode scheduler in background
   startSleepScheduler().catch(err => logger.error({ err }, '[Startup] Sleep scheduler failed'));
-  
+
   app.listen(PORT, () => {
-    logger.info(`[Server] WaxPrep v3.0 listening on port ${PORT}`);
+    logger.info(`[Server] WaxPrep v3.1 listening on port ${PORT}`);
   });
 }
 

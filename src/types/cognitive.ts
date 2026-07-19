@@ -404,6 +404,6 @@ export interface CognitiveConfigMap {
   prediction: { enabled: boolean; preload_ttl_seconds: number; prediction_horizon_days: number };
   palace: { enabled: boolean; auto_construct: boolean; max_wings: number; max_rooms_per_wing: number };
   tool_memory: { enabled: boolean; learn_from_failures: boolean; dependency_tracking: boolean };
-  sleep_mode: { enabled: boolean; schedule_cron: string; timezone_aware: boolean; max_students_per_night: number };
+  sleep_mode: { enabled: boolean; schedule_cron: string; tick_cron?: string; local_hour?: number; timezone_aware: boolean; max_students_per_night: number; min_hours_between_runs?: number; lookback_days?: number; batch_size?: number };
   graph: { adapter: 'postgres' | 'neo4j'; neo4j_uri: string | null; neo4j_user: string | null; embedding_dimension: number };
 }
