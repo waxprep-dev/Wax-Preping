@@ -111,15 +111,15 @@ async function handleWebSearch(params: Record<string, unknown>): Promise<ToolRes
       };
     }
 
-    const data = await response.json();
-    const results = (data.webPages?.value || []).map((r: Record<string, unknown>) => ({
+    const data = await response.json() as { webPages?: { value?: Array<{ name: string; url: string; snippet: string }> } };
+    const results = (data.webPages?.value || []).map((r) => ({
       title: r.name,
       url: r.url,
       snippet: r.snippet,
     }));
 
     const output = results.length > 0
-      ? results.map((r: Record<string, unknown>) => `- ${r.title}: ${r.snippet} (${r.url})`).join('\n')
+      ? results.map((r) => `- ${r.title}: ${r.snippet} (${r.url})`).join('\n')
       : 'No web results found.';
 
     return {
