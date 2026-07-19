@@ -63,18 +63,12 @@ function requireAdminRateLimit(req: Request, res: Response, next: NextFunction):
     .catch(() => next()); // If rate limiter fails, allow through
 }
 
-// Capture raw body for Meta signature verification BEFORE express.json() parses
-app.use((req: Request, res: Response, next: NextFunction) => {
-  let data = '';
-  req.setEncoding('utf8');
-  req.on('data', chunk => { data += chunk; });
-  req.on('end', () => {
-    (req as Request & { rawBody?: Buffer }).rawBody = Buffer.from(data);
-    next();
-  });
-});
-
-app.use(express.json());
+// Capture raw body for Meta signature verification
+app.use(express.json({
+  verify: (req: Request, _res: Response, buf: Buffer) => {
+    (req as Request & { rawBody?: Buffer }).rawBody = buf;
+  },
+}));
 
 app.get('/health', (_req: Request, res: Response) => {
   res.status(200).json({ status: 'ok', version: '3.0.0-cognitive' });
