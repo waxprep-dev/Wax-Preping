@@ -27,6 +27,7 @@ import { ensurePalace, discoverTunnels } from './palace/organizer';
 import { getPalaceHierarchy, getPalaceStats } from './palace/hierarchy';
 import { runSleepMode } from './sleep/pipeline';
 import { startSleepScheduler } from './sleep/scheduler';
+import { checkRateLimit } from './middleware/rate_limiter';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -42,6 +43,23 @@ function requireAdmin(req: Request, res: Response, next: NextFunction): void {
     return;
   }
   next();
+}
+
+/**
+ * Admin rate limiting middleware.
+ * Limits admin routes to 100 requests per 15 minutes per IP.
+ */
+function requireAdminRateLimit(req: Request, res: Response, next: NextFunction): void {
+  const ip = req.ip || req.socket.remoteAddress || 'unknown';
+  checkRateLimit(`admin:${ip}`, 100, 900)
+    .then(result => {
+      if (!result.allowed) {
+        res.status(429).json({ error: 'Too many requests. Try again later.' });
+        return;
+      }
+      next();
+    })
+    .catch(() => next()); // If rate limiter fails, allow through
 }
 
 // Capture raw body for Meta signature verification BEFORE express.json() parses
@@ -62,8 +80,8 @@ app.get('/health', (_req: Request, res: Response) => {
 });
 
 // ── Admin Routes ─────────────────────────────────────────────────────────
-// All /admin routes require authentication
-app.use('/admin', requireAdmin);
+// All /admin routes require authentication and rate limiting
+app.use('/admin', requireAdminRateLimit, requireAdmin);
 
 // ── Admin Routes: Student Profile ────────────────────────────────────────
 
