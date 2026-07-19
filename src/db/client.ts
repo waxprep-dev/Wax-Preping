@@ -353,6 +353,9 @@ export async function initializeDatabase(): Promise<void> {
     CREATE INDEX IF NOT EXISTS processed_messages_time_idx ON processed_messages (processed_at);
   `);
 
+  // Cleanup old processed messages (keep 7 days)
+  await db.query(`DELETE FROM processed_messages WHERE processed_at < NOW() - INTERVAL '7 days'`).catch(() => {});
+
   // =====================================================================
   // v3.0 COGNITIVE MEMORY ARCHITECTURE TABLES
   // =====================================================================
