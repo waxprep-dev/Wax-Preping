@@ -9,7 +9,6 @@ import { db } from '../db/client';
 import { DEFAULT_BKT, type BktParams } from '../teaching/bkt';
 
 export async function getConceptBktParams(conceptId: string): Promise<BktParams> {
-  await ensureCurriculumSchema();
   const r = await db.query(
     `SELECT p_l0, p_t, p_g, p_s FROM bkt_concept_params WHERE concept_id = $1`,
     [conceptId]
@@ -32,7 +31,6 @@ export async function logTraceEvent(input: {
   pAfter: number;
   source?: string;
 }): Promise<void> {
-  await ensureCurriculumSchema();
   await db.query(
     `INSERT INTO knowledge_trace_events (student_id, concept_id, success, p_before, p_after, source)
      VALUES ($1,$2,$3,$4,$5,$6)`,
@@ -45,7 +43,6 @@ export async function logTraceEvent(input: {
  * Called from workers — not on the WhatsApp hot path.
  */
 export async function refitConceptParams(conceptId: string): Promise<BktParams> {
-  await ensureCurriculumSchema();
   const r = await db.query(
     `SELECT success, p_before FROM knowledge_trace_events
      WHERE concept_id = $1 ORDER BY created_at DESC LIMIT 500`,
