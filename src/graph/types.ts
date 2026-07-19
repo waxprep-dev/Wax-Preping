@@ -33,6 +33,7 @@ export interface TraversalOptions {
   direction?: 'out' | 'in' | 'both';
   nodeFilter?: Record<string, unknown>;
   timeRange?: [Date, Date];
+  limit?: number;
 }
 
 export interface SimilaritySearchOptions {
