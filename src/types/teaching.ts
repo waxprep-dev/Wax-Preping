@@ -1,5 +1,5 @@
 /**
- * Teaching-engine types — the heart of v2.0 / v3.1 cognitive fusion.
+ * Teaching-engine types - the heart of v2.0 / v3.1 cognitive fusion.
  *
  * The v1 system scattered its "thinking" across 5-9 sequential LLM calls
  * (router, emotional agent, cultural agent, chain stages 1-3, pedagogy agent,
@@ -20,19 +20,6 @@ import type {
 import type { UsageSummary } from './llm';
 import type { BoundaryDecision, PreloadContext, MemoryChunk } from './cognitive';
 
-export interface CurriculumAssessment {
-  masteryAssessment: 'mastered' | 'progressing' | 'struggling' | 'surface_learned';
-  nextConcept: string | null;
-  paceRecommendation: 'accelerate' | 'maintain' | 'slow_down';
-  conceptBelief: {
-    claim: string;
-    status: 'MASTERS' | 'UNDERSTANDS' | 'CONFUSES' | 'HAS_NOT_SEEN';
-    confidence: 'high' | 'medium' | 'low';
-    evidence: string;
-  } | null;
-  curriculumNote: string;
-  scheduleReview: boolean;
-}
 
 export interface CurriculumAssessment {
   masteryAssessment: 'mastered' | 'progressing' | 'struggling' | 'surface_learned';
