@@ -86,53 +86,8 @@ export interface SessionBoundaryRecord {
 
 export type GraphNodeLabel = 'Episode' | 'Concept' | 'Fact' | 'State' | 'ToolResult' | 'Insight' | 'Community' | string;
 
-export interface GraphNode {
-  id: string;
-  labels: GraphNodeLabel[];
-  properties: Record<string, unknown>;
-  embedding?: number[];
-  event_time: Date;
-  ingest_time: Date;
-  validity_window?: [Date | null, Date | null];
-  student_id?: string;
-  source?: string;
-  created_at: Date;
-}
-
-export interface GraphEdge {
-  id: string;
-  source_id: string;
-  target_id: string;
-  type: string;
-  properties: Record<string, unknown>;
-  event_time: Date;
-  ingest_time: Date;
-  validity_window?: [Date | null, Date | null];
-  student_id?: string;
-  created_at: Date;
-}
-
-export interface GraphPath {
-  nodes: GraphNode[];
-  edges: GraphEdge[];
-  length: number;
-}
-
+import type { GraphAdapter } from '../graph/interfaces';
 export type GraphQueryResult = GraphNode | GraphEdge | GraphPath | Record<string, unknown>;
-
-export interface GraphAdapter {
-  createNode(node: Omit<GraphNode, 'id' | 'created_at'>): Promise<GraphNode>;
-  createEdge(edge: Omit<GraphEdge, 'id' | 'created_at'>): Promise<GraphEdge>;
-  getNode(id: string): Promise<GraphNode | null>;
-  getEdges(nodeId: string, direction: 'out' | 'in' | 'both', type?: string): Promise<GraphEdge[]>;
-  searchNodes(filters: Record<string, unknown>, limit?: number): Promise<GraphNode[]>;
-  traverse(startNodeId: string, edgeTypes: string[], depth: number): Promise<GraphPath[]>;
-  updateNode(id: string, updates: Partial<GraphNode>): Promise<GraphNode>;
-  invalidateEdge(id: string, reason?: string): Promise<void>;
-  queryBiTemporal(nodeLabel: string, studentId: string, atTime: Date): Promise<GraphNode[]>;
-  findSimilar(embedding: number[], limit?: number, studentId?: string): Promise<GraphNode[]>;
-  deleteNode(id: string): Promise<void>;
-}
 
 // =============================================================================
 // BREAKTHROUGH 3: HUMAN-LIKE FORGETTING ENGINE
