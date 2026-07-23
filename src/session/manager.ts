@@ -186,40 +186,69 @@ export async function evaluateAndMaybeRotateSession(
       '[Session] Cognitive boundary detected — rotating session'
     );
 
-    await endSession(session.sessionId);
+    const client = await db.connect();
+    try {
+      await client.query('BEGIN');
 
-    // Continuity: carry concept/subject when boundary is emotional/external, not topic shift
-    const carryConcept =
-      boundary.boundary_type !== 'TOPIC_SHIFT' &&
-      boundary.boundary_type !== 'topic_shift';
+      await client.query(`UPDATE sessions SET is_active = FALSE WHERE session_id = $1`, [session.sessionId]);
 
-    const newSession = await createSession(studentId, {
-      currentConcept: carryConcept ? session.state.currentConcept : null,
-      currentSubject: carryConcept ? session.state.currentSubject : null,
-      foundationGapDisclosed: session.state.foundationGapDisclosed,
-      readinessSignal: false,
-    });
+      // Continuity: carry concept/subject when boundary is emotional/external, not topic shift
+      const carryConcept =
+        boundary.boundary_type !== 'TOPIC_SHIFT' &&
+        boundary.boundary_type !== 'topic_shift';
 
-    // Persist boundary linkage if table supports new_session_id updates
-    await db
-      .query(
-        `UPDATE session_boundaries
-         SET new_session_id = $1
-         WHERE id = (
-           SELECT id FROM session_boundaries
-           WHERE student_id = $2
-             AND previous_session_id = $3
-             AND (new_session_id IS NULL OR new_session_id = '')
-           ORDER BY detected_at DESC
-           LIMIT 1
-         )`,
-        [newSession.sessionId, studentId, session.sessionId]
-      )
-      .catch(() => {
-        /* non-fatal — segmentation module may already have inserted */
-      });
+      const newSessionId = uuidv4();
+      const newState = {
+        currentConcept: carryConcept ? session.state.currentConcept : null,
+        currentSubject: carryConcept ? session.state.currentSubject : null,
+        foundationGapDisclosed: session.state.foundationGapDisclosed,
+        readinessSignal: false,
+      };
 
-    return { session: newSession, boundary, rotated: true };
+      await client.query(
+        `INSERT INTO sessions (session_id, student_id, started_at, last_activity_at, turn_count, is_active, state)
+         VALUES ($1, $2, NOW(), NOW(), 0, TRUE, $3)`,
+        [newSessionId, studentId, JSON.stringify(newState)]
+      );
+
+      const newSession: Session = {
+        sessionId: newSessionId,
+        studentId,
+        startedAt: new Date(),
+        lastActivityAt: new Date(),
+        turnCount: 0,
+        isActive: true,
+        state: { ...DEFAULT_SESSION_STATE, ...newState },
+        isNewSession: true,
+      };
+
+      // Persist boundary linkage if table supports new_session_id updates
+      await client
+        .query(
+          `UPDATE session_boundaries
+           SET new_session_id = $1
+           WHERE id = (
+             SELECT id FROM session_boundaries
+             WHERE student_id = $2
+               AND previous_session_id = $3
+               AND (new_session_id IS NULL OR new_session_id = '')
+             ORDER BY detected_at DESC
+             LIMIT 1
+           )`,
+          [newSessionId, studentId, session.sessionId]
+        )
+        .catch(() => {
+          /* non-fatal — segmentation module may already have inserted */
+        });
+
+      await client.query('COMMIT');
+      return { session: newSession, boundary, rotated: true };
+    } catch (txErr) {
+      await client.query('ROLLBACK').catch(() => {});
+      throw txErr;
+    } finally {
+      client.release();
+    }
   } catch (err) {
     logger.warn({ err, studentId }, '[Session] Boundary evaluation failed — continuing session');
 

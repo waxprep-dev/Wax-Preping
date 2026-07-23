@@ -7,38 +7,11 @@
  *   - defense hits
  *   - latency
  *
- * Stored in teaching_metrics (created on first write). Powers future
- * prompt-evolution fitness beyond generic engagement scores.
+ * Schema lives in db/client.ts initializeDatabase().
  */
 
 import { db } from '../db/client';
 import { logger } from '../middleware/logger';
-
-let ensured = false;
-
-async function ensureTable(): Promise<void> {
-  if (ensured) return;
-  await db.query(`
-    CREATE TABLE IF NOT EXISTS teaching_metrics (
-      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      student_id TEXT NOT NULL,
-      session_id TEXT NOT NULL,
-      turn_number INT,
-      asked_question BOOLEAN DEFAULT FALSE,
-      taught_content BOOLEAN DEFAULT FALSE,
-      policy_move TEXT,
-      strategy TEXT,
-      defense_issues INT DEFAULT 0,
-      latency_ms INT,
-      created_at TIMESTAMPTZ DEFAULT NOW()
-    )
-  `).catch(() => {});
-  await db.query(`
-    CREATE INDEX IF NOT EXISTS teaching_metrics_student_idx
-    ON teaching_metrics (student_id, created_at DESC)
-  `).catch(() => {});
-  ensured = true;
-}
 
 export interface TurnMetric {
   studentId: string;
@@ -54,7 +27,6 @@ export interface TurnMetric {
 
 export async function recordTurnMetric(m: TurnMetric): Promise<void> {
   try {
-    await ensureTable();
     await db.query(
       `INSERT INTO teaching_metrics
        (student_id, session_id, turn_number, asked_question, taught_content, policy_move, strategy, defense_issues, latency_ms)
@@ -81,7 +53,6 @@ export async function getStudentTeachStats(
   lastN = 50
 ): Promise<{ questionRate: number; teachRate: number; samples: number }> {
   try {
-    await ensureTable();
     const r = await db.query(
       `SELECT asked_question, taught_content FROM teaching_metrics
        WHERE student_id = $1 ORDER BY created_at DESC LIMIT $2`,

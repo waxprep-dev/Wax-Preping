@@ -55,35 +55,11 @@ const DEFAULT_MAX_SOURCES = 3;
 const SOURCE_COOLDOWN_HOURS = 72;
 
 /**
- * Ensure tracking table exists (idempotent).
- */
-export async function ensureIngestSchema(): Promise<void> {
-  await db.query(`
-    CREATE TABLE IF NOT EXISTS syllabus_ingest_runs (
-      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      source_url TEXT NOT NULL,
-      subject TEXT,
-      exam_board TEXT,
-      status TEXT NOT NULL DEFAULT 'started',
-      chunks_inserted INT NOT NULL DEFAULT 0,
-      error_message TEXT,
-      metadata JSONB NOT NULL DEFAULT '{}',
-      started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      completed_at TIMESTAMPTZ
-    );
-    CREATE INDEX IF NOT EXISTS idx_syllabus_ingest_url ON syllabus_ingest_runs(source_url);
-    CREATE INDEX IF NOT EXISTS idx_syllabus_ingest_started ON syllabus_ingest_runs(started_at DESC);
-  `).catch(err => logger.debug({ err }, '[AutoIngest] schema ensure failed'));
-}
-
-/**
  * Main entry: discover + fetch + structure + store.
  */
 export async function autoIngestSyllabus(
   req: AutoIngestRequest
 ): Promise<AutoIngestResult> {
-  await ensureIngestSchema();
-
   const subject = (req.subject || '').trim();
   const examBoard = (req.examBoard || '').trim();
   const level = (req.level || '').trim();
@@ -213,7 +189,6 @@ export async function ingestFromUrl(
   url: string,
   meta: { subject?: string; examBoard?: string; level?: string; studentId?: string; force?: boolean } = {}
 ): Promise<AutoIngestResult> {
-  await ensureIngestSchema();
   if (!meta.force && (await recentlyIngested(url))) {
     return {
       ok: true,

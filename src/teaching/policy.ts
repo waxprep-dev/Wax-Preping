@@ -19,6 +19,7 @@
 
 import type { PerceptionResult, TeachingPlan, TeachingStrategy } from '../types/teaching';
 import type { SessionState, StudentProfile } from '../types/student';
+import { uniqueStrings } from '../utils/math';
 
 export type MoveType =
   | 'welcome_and_orient'
@@ -525,18 +526,6 @@ export function applyPolicyToPlan(plan: TeachingPlan, policy: TeachingPolicy): T
     bloomTarget: policy.bloomTarget || plan.bloomTarget,
     useAnalogy: policy.mustTeachContent ? plan.useAnalogy : plan.useAnalogy && !policy.move.includes('welcome'),
   };
-}
-
-function uniqueStrings(items: string[]): string[] {
-  const seen = new Set<string>();
-  const out: string[] = [];
-  for (const item of items) {
-    const key = item.toLowerCase().trim();
-    if (!key || seen.has(key)) continue;
-    seen.add(key);
-    out.push(item);
-  }
-  return out;
 }
 
 /** Detect if a tutor response ends with / contains a question (for session accounting). */

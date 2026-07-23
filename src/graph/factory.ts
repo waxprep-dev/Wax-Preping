@@ -19,13 +19,20 @@ export async function getGraphAdapter(): Promise<GraphAdapter> {
   const adapterType = config.adapter || 'postgres';
 
   if (adapterType === 'neo4j') {
-    logger.info('[GraphFactory] Using Neo4j adapter');
-    adapterInstance = new Neo4jGraphAdapter();
-  } else {
-    logger.info('[GraphFactory] Using PostgreSQL-native adapter');
-    adapterInstance = new PostgresGraphAdapter();
+    logger.info('[GraphFactory] Attempting Neo4j adapter');
+    const neo4jAdapter = new Neo4jGraphAdapter();
+    try {
+      await neo4jAdapter.connect();
+      adapterInstance = neo4jAdapter;
+      logger.info('[GraphFactory] Neo4j connected');
+      return adapterInstance;
+    } catch (err) {
+      logger.warn({ err }, '[GraphFactory] Neo4j connect failed — falling back to PostgreSQL');
+    }
   }
 
+  logger.info('[GraphFactory] Using PostgreSQL-native adapter');
+  adapterInstance = new PostgresGraphAdapter();
   await adapterInstance.connect();
   return adapterInstance;
 }

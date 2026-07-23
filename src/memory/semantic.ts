@@ -16,6 +16,7 @@
 import { db } from '../db/client';
 import { logger } from '../middleware/logger';
 import { getGraphAdapter } from '../graph/factory';
+import { DEFAULT_BKT, bktFromResult, type BktParams } from '../teaching/bkt';
 import type {
   StudentProfile,
   StudentFact,
@@ -28,33 +29,7 @@ import type {
 const profileCache = new Map<string, { profile: StudentProfile; expiresAt: number }>();
 const CACHE_TTL_MS = 60_000;
 
-const DEFAULT_BKT = { pL0: 0.3, pT: 0.2, pS: 0.1, pG: 0.3 };
-
-function bktFromResult(
-  pBefore: number,
-  result: 'success' | 'struggle' | 'neutral',
-  params = DEFAULT_BKT
-): number {
-  const { pT, pS, pG } = params;
-  if (result === 'neutral') return pBefore;
-
-  const isCorrect = result === 'success';
-  const pCorrectIfLearned = 1 - pS;
-  const pCorrectIfNotLearned = pG;
-
-  const numerator = isCorrect
-    ? pBefore * pCorrectIfLearned
-    : pBefore * (1 - pCorrectIfLearned);
-  const denominator = isCorrect
-    ? pBefore * pCorrectIfLearned + (1 - pBefore) * pCorrectIfNotLearned
-    : pBefore * (1 - pCorrectIfLearned) + (1 - pBefore) * (1 - pCorrectIfNotLearned);
-
-  const pLearnedGivenEvidence = numerator / (denominator || 1);
-
-  return pLearnedGivenEvidence + (1 - pLearnedGivenEvidence) * pT;
-}
-
-async function getConceptBktParams(conceptId: string): Promise<typeof DEFAULT_BKT> {
+async function getConceptBktParams(conceptId: string): Promise<BktParams> {
   try {
     const result = await db.query(
       `SELECT AVG(CASE WHEN success THEN p_after ELSE NULL END) as avg_success_p,

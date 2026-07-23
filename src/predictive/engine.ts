@@ -4,28 +4,14 @@
  * Runs on a schedule and before predicted session starts.
  */
 
-import { createClient, RedisClientType } from 'redis';
+import { getRedis } from '../db/redis';
 import { getCognitiveConfig } from '../config/cognitive';
 import { getForgettingParams } from '../config/cognitive';
 import { logger } from '../middleware/logger';
 import { db } from '../db/client';
 import type { PreloadContext, PredictivePreload, ForgettingParams } from '../types/cognitive';
 import { predictNextTopic, predictFrustration, predictStrugglingConcepts } from './predictors';
-
-let redisClient: RedisClientType | null = null;
-
-async function getRedis(): Promise<RedisClientType | null> {
-  if (redisClient) return redisClient;
-  if (!process.env.REDIS_URL) return null;
-
-  try {
-    redisClient = createClient({ url: process.env.REDIS_URL }) as RedisClientType;
-    await redisClient.connect();
-    return redisClient;
-  } catch {
-    return null;
-  }
-}
+import { getArchetypePromptModifier } from '../student_profile/archetypes';
 
 /**
  * Main predictive pre-load function.
@@ -59,7 +45,7 @@ export async function predictivePreLoad(studentId: string): Promise<PreloadConte
     }
 
     // 6. Archetype modifier
-    const archetypeModifier = await getArchetypeModifier(studentId);
+    const archetypeModifier = await getArchetypePromptModifier(studentId) || null;
 
     const context: PreloadContext = {
       student_id: studentId,
@@ -200,34 +186,6 @@ async function preComputeHint(topic: string, studentId: string): Promise<string>
  */
 async function preComputeAnalogy(topic: string, studentId: string): Promise<string> {
   return `Think of ${topic} like something familiar in your daily life.`;
-}
-
-/**
- * Get archetype-based prompt modifier.
- */
-async function getArchetypeModifier(studentId: string): Promise<string | null> {
-  const result = await db.query(
-    `SELECT a.name, a.config 
-     FROM student_archetypes a
-     JOIN student_archetype_memberships m ON a.id = m.archetype_id
-     WHERE m.student_id = $1
-     ORDER BY m.similarity_score DESC
-     LIMIT 1`,
-    [studentId]
-  );
-
-  if (result.rows.length === 0) return null;
-
-  const archetype = result.rows[0].name as string;
-  const modifiers: Record<string, string> = {
-    panic_crammer: 'Focus on exam-relevant shortcuts and high-yield facts. Be concise.',
-    deep_diver: 'Provide depth, connections, and theoretical foundations. Encourage exploration.',
-    homework_helper: 'Give bite-sized, just-in-time help. Get to the point quickly.',
-    steady_builder: 'Use structured, scaffolded progression. Build systematically.',
-    confidence_seeker: 'Celebrate small wins. Be gentle. Provide frequent reassurance.',
-  };
-
-  return modifiers[archetype] || null;
 }
 
 /**

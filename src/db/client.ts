@@ -357,6 +357,125 @@ export async function initializeDatabase(): Promise<void> {
   // Cleanup old processed messages (keep 7 days)
   await db.query(`DELETE FROM processed_messages WHERE processed_at < NOW() - INTERVAL '7 days'`).catch(() => {});
 
+  // Teaching metrics (observability)
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS teaching_metrics (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      student_id TEXT NOT NULL,
+      session_id TEXT NOT NULL,
+      turn_number INT,
+      asked_question BOOLEAN DEFAULT FALSE,
+      taught_content BOOLEAN DEFAULT FALSE,
+      policy_move TEXT,
+      strategy TEXT,
+      defense_issues INT DEFAULT 0,
+      latency_ms INT,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS teaching_metrics_student_idx ON teaching_metrics (student_id, created_at DESC);
+  `);
+
+  // AI reflections (self-critique)
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS ai_reflections (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      student_id TEXT NOT NULL,
+      session_id TEXT NOT NULL,
+      turn_number INT NOT NULL,
+      student_message TEXT,
+      tutor_response TEXT,
+      critique TEXT,
+      improvement TEXT,
+      confidence_score FLOAT,
+      would_do_differently TEXT,
+      timestamp TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_ai_reflections_student ON ai_reflections(student_id, timestamp DESC);
+  `);
+
+  // Prompt performance tracking
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS prompt_performance (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      component_id TEXT NOT NULL,
+      student_id TEXT NOT NULL,
+      session_id TEXT NOT NULL,
+      turn_number INT NOT NULL,
+      student_engagement FLOAT,
+      mastery_signal BOOLEAN DEFAULT FALSE,
+      shame_spike BOOLEAN DEFAULT FALSE,
+      frustration_spike BOOLEAN DEFAULT FALSE,
+      flow_maintained BOOLEAN DEFAULT FALSE,
+      answer_leak BOOLEAN DEFAULT FALSE,
+      timestamp TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_prompt_perf_component ON prompt_performance(component_id, timestamp DESC);
+  `);
+
+  // Prompt evolution log
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS prompt_evolution_log (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      component_id TEXT NOT NULL,
+      old_content TEXT,
+      new_content TEXT,
+      old_fitness FLOAT,
+      new_fitness FLOAT,
+      reason TEXT,
+      timestamp TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_prompt_evol_component ON prompt_evolution_log(component_id, timestamp DESC);
+  `);
+
+  // Spaced reviews (SM-2)
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS spaced_reviews (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      student_id TEXT NOT NULL,
+      concept TEXT NOT NULL,
+      subject TEXT,
+      next_review_at TIMESTAMPTZ,
+      interval_days FLOAT DEFAULT 1,
+      review_count INT DEFAULT 0,
+      mastery_level FLOAT DEFAULT 0.1,
+      UNIQUE(student_id, concept)
+    );
+    CREATE INDEX IF NOT EXISTS idx_spaced_reviews_student ON spaced_reviews(student_id);
+    CREATE INDEX IF NOT EXISTS idx_spaced_reviews_next ON spaced_reviews(next_review_at);
+  `);
+
+  // World model state
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS world_model_state (
+      student_id TEXT PRIMARY KEY,
+      predicted_next_mistake TEXT,
+      predicted_forget_concepts JSONB DEFAULT '[]',
+      predicted_frustration_probability FLOAT DEFAULT 0,
+      predicted_flow_probability FLOAT DEFAULT 0,
+      predicted_exam_score FLOAT DEFAULT 0,
+      predicted_exam_score_trend TEXT DEFAULT 'stable',
+      model_updated_at TIMESTAMPTZ DEFAULT NOW()
+    );
+  `);
+
+  // Syllabus ingest tracking
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS syllabus_ingest_runs (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      source_url TEXT NOT NULL,
+      subject TEXT,
+      exam_board TEXT,
+      status TEXT NOT NULL DEFAULT 'started',
+      chunks_inserted INT NOT NULL DEFAULT 0,
+      error_message TEXT,
+      metadata JSONB NOT NULL DEFAULT '{}',
+      started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      completed_at TIMESTAMPTZ
+    );
+    CREATE INDEX IF NOT EXISTS idx_syllabus_ingest_url ON syllabus_ingest_runs(source_url);
+    CREATE INDEX IF NOT EXISTS idx_syllabus_ingest_started ON syllabus_ingest_runs(started_at DESC);
+  `);
+
   //=====================================================================
   // v3.0 COGNITIVE MEMORY ARCHITECTURE TABLES
   //=====================================================================

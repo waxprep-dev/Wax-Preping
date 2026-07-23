@@ -12,6 +12,7 @@
 import { routeAndCall } from '../llm/router';
 import { getPrompt } from '../config/prompts';
 import { logger } from '../middleware/logger';
+import { clamp01 } from '../utils/math';
 import { extractTextFeatures } from './text';
 import { analyzeImage, downloadWhatsAppMedia } from './image';
 import { transcribeVoice } from './voice';
@@ -171,9 +172,4 @@ export async function perceive(
     logger.warn({ err }, '[Perception] Fusion failed — using heuristic fallback');
     return fallback;
   }
-}
-
-function clamp01(v: unknown, fallback: number): number {
-  const n = typeof v === 'number' ? v : fallback;
-  return Math.max(0, Math.min(1, n));
 }

@@ -10,6 +10,7 @@
  */
 import { routeAndCall } from '../llm/router';
 import { getPrompt } from '../config/prompts';
+import { f2 } from '../utils/math';
 import type { TeachingPlan, TurnContext } from '../types/teaching';
 import type { LLMResponse } from '../types/llm';
 
@@ -104,10 +105,6 @@ export async function generate(ctx: TurnContext, plan: TeachingPlan): Promise<LL
   response.content = stripRoboticOpeners(response.content);
 
   return response;
-}
-
-function f2(n: number): string {
-  return n.toFixed(2);
 }
 
 export function stripTrailingQuestions(text: string): string {

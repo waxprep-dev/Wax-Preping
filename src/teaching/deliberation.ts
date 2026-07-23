@@ -12,6 +12,7 @@ import { routeAndCall } from '../llm/router';
 import { getPrompt } from '../config/prompts';
 import { logger } from '../middleware/logger';
 import { db } from '../db/client';
+import { clamp01, f2 } from '../utils/math';
 import {
   applyPolicyToPlan,
   decideTeachingPolicy,
@@ -267,13 +268,4 @@ function uniqueSoft(items: string[]): string[] {
     out.push(item);
   }
   return out;
-}
-
-function clamp01(v: unknown, fallback: number): number {
-  const n = typeof v === 'number' ? v : fallback;
-  return Math.max(0, Math.min(1, n));
-}
-
-function f2(n: number): string {
-  return n.toFixed(2);
 }
